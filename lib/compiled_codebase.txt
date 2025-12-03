@@ -1,0 +1,3218 @@
+
+================================================================================
+Folder: .
+================================================================================
+
+------------------------------------------------------------
+File: cms.ex
+------------------------------------------------------------
+defmodule Cms do
+  @moduledoc """
+  Documentation for `Cms`.
+  """
+
+  @doc """
+  Hello world.
+
+  ## Examples
+
+      iex> Cms.hello()
+      :world
+
+  """
+  def hello do
+    :world
+  end
+end
+
+
+------------------------------------------------------------
+File: consolidator.py
+------------------------------------------------------------
+import os
+
+def compile_codebase_to_text(root_dir, output_file):
+    """
+    Recursively gathers all files in a codebase and compiles them
+    into a single text file with folder structure annotations.
+    """
+    with open(output_file, 'w', encoding='utf-8') as out_file:
+        for dirpath, dirnames, filenames in os.walk(root_dir):
+            # Write folder header
+            relative_path = os.path.relpath(dirpath, root_dir)
+            folder_header = f"\n{'='*80}\nFolder: {relative_path}\n{'='*80}\n"
+            out_file.write(folder_header)
+            
+            for filename in filenames:
+                file_path = os.path.join(dirpath, filename)
+                try:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        file_content = f.read()
+                except Exception as e:
+                    file_content = f"Could not read file: {e}"
+                
+                # Write file header and content
+                file_header = f"\n{'-'*60}\nFile: {filename}\n{'-'*60}\n"
+                out_file.write(file_header)
+                out_file.write(file_content + "\n")
+
+    print(f"Codebase compiled successfully into {output_file}")
+
+
+if __name__ == "__main__":
+    # Current working directory
+    root_directory = os.getcwd()
+    output_text_file = os.path.join(root_directory, "compiled_codebase.txt")
+    
+    compile_codebase_to_text(root_directory, output_text_file)
+
+
+
+------------------------------------------------------------
+File: compiled_codebase.txt
+------------------------------------------------------------
+
+
+================================================================================
+Folder: cms
+================================================================================
+
+------------------------------------------------------------
+File: application.ex
+------------------------------------------------------------
+defmodule CMS.Application do
+  use Application
+
+  @impl true
+  def start(_type, _args) do
+    children = [
+      # 1. Core Registries
+      {Registry, keys: :unique, name: CMS.NodeRegistry},
+      {Registry, keys: :unique, name: CMS.QueryCoordinatorRegistry},
+
+      # 2. Communication Backbone (Cognitive Bus)
+      {Phoenix.PubSub, name: CMS.PubSub},
+
+      # 3. Persistence Layer
+      CMS.EpochManager,
+      CMS.LogAppender,
+      CMS.VectorRouter,
+
+      # 4. Learning & Regulation Layer
+      CMS.ActivationEngine,
+      CMS.DecayManager,
+      CMS.ModelDriftManager,
+      CMS.HebbianBufferSupervisor,
+
+      # 5. Pipeline & Ingestion
+      # REMOVED: CMS.QueryRouter (It is started by CMS.BusPipeline)
+      CMS.BusPipeline,
+      CMS.IngestionEngine,
+
+      # 6. The Node Population
+      CMS.NodeSupervisor
+    ]
+
+    opts = [strategy: :one_for_one, name: CMS.Supervisor]
+    Supervisor.start_link(children, opts)
+  end
+end
+
+
+================================================================================
+Folder: cms/services
+================================================================================
+
+------------------------------------------------------------
+File: node_drift_manager.ex
+------------------------------------------------------------
+defmodule CMS.NodeDriftManager do
+  use GenServer
+  require Logger
+
+  alias CMS.{NodeSupervisor, SemanticRegion, LogAppender}
+
+  @moduledoc """
+  Monitors and repairs Semantic Region Drift.
+
+  Implements Section 11.4: Node Migration Logic (Gap 11).
+
+  CRITICAL UPDATE: Uses Task.async_stream for high-concurrency, non-blocking checks.
+  """
+
+  # Configuration
+  @check_interval :timer.minutes(30)
+  @batch_size 100 # Batch size is now used as the max_concurrency for throttling checks
+
+  def start_link(_opts) do
+    GenServer.start_link(__MODULE__, :ok, name: __MODULE__)
+  end
+
+  @impl true
+  def init(:ok) do
+    Process.send_after(self(), :check_drift, @check_interval)
+    {:ok, %{}}
+  end
+
+  @impl true
+  # --- CONCURRENCY REFACTOR: Using Task.async_stream for efficient checking ---
+  def handle_info(:check_drift, state) do
+    Logger.debug("NodeDriftManager: Initiating topology alignment check.")
+
+    nodes_to_check = NodeSupervisor.get_all_active_node_pids()
+
+    # Task.async_stream provides throttled concurrency control
+    nodes_to_check
+    |> Task.async_stream(&check_node/1, max_concurrency: @batch_size)
+    |> Enum.each(fn
+      {:ok, result} ->
+        # Result is either :migrated or :noop, which is handled by check_node/1's side effects
+        result
+      {:error, reason} ->
+        Logger.error("NodeDriftManager: Async check failed: #{inspect(reason)}")
+    end)
+
+    Logger.info("NodeDriftManager: Dispatched checks for #{length(nodes_to_check)} nodes.")
+
+    Process.send_after(self(), :check_drift, @check_interval)
+    {:noreply, state}
+  end
+
+  # --- FUNCTION REFACTOR: Removed redundant Task.start wrapper ---
+  defp check_node(pid) do
+    try do
+      # Note: This is a synchronous call, but the caller (handle_info) runs it concurrently.
+      {node_id, embedding, model_version, current_region_id} =
+        GenServer.call(pid, :get_drift_info, 5000)
+
+      correct_region_id = SemanticRegion.compute_region_hash(embedding, model_version)
+
+      if correct_region_id != current_region_id do
+        migrate_node(pid, node_id, current_region_id, correct_region_id)
+        :migrated
+      else
+        :noop
+      end
+    catch
+      _, _ -> :noop # Node likely decayed, crashed, or call timed out during check
+    end
+  end
+
+  def migrate_node(pid, node_id, old_region, new_region) do
+    CMS.SemanticRegion.unsubscribe(old_region, node_id)
+    GenServer.cast(pid, {:update_region, new_region})
+    CMS.SemanticRegion.subscribe(new_region, node_id)
+
+    # CRITICAL: Append migration event to the log for auditability
+    LogAppender.append_node_event(node_id, :node_migrated, %{
+      previous_region: old_region,
+      new_region: new_region,
+      reason: "semantic_drift_correction"
+    })
+
+    Logger.info("Node #{node_id} migrated to Region #{new_region}.")
+  end
+end
+
+
+------------------------------------------------------------
+File: security.ex
+------------------------------------------------------------
+defmodule CMS.Security do
+  @moduledoc """
+  Manages Access Control Lists (ACLs) and permission enforcement.
+
+  CRITICAL UPDATE (Gap 11/12): Now supports structured ACL maps for granular control.
+  """
+
+  # Pre-defined system roles/IDs that always grant access
+  @system_roles ["root", "system"]
+  @public_role "public"
+
+  @doc """
+  Checks if an Agent ID has permission to perform a WRITE action on a specific structured ACL.
+  """
+  @spec can_write?(String.t(), map()) :: boolean()
+  def can_write?(agent_id, acls) do
+    # In a real system, this checks signatures or tokens.
+    # For Version 2.0, we check strict membership in the :write list or 'root' privileges.
+
+    write_list = Map.get(acls, :write, [])
+
+    # Agent must be explicitly listed in the write ACLs or be a recognized system role
+    Enum.member?(write_list, agent_id) || Enum.member?(@system_roles, agent_id)
+  end
+
+  @doc """
+  Checks if an Agent ID has permission to perform a READ action on a specific structured ACL.
+  """
+  @spec can_read?(String.t(), map()) :: boolean()
+  def can_read?(agent_id, acls) do
+    read_list = Map.get(acls, :read, [])
+
+    # Access is granted if:
+    # 1. The node is publicly readable.
+    # 2. The agent is explicitly listed in the read ACLs.
+    # 3. The agent is a recognized system role (can read anything).
+    Enum.member?(read_list, @public_role) || Enum.member?(read_list, agent_id) || Enum.member?(@system_roles, agent_id)
+  end
+end
+
+
+------------------------------------------------------------
+File: meta_node.ex
+------------------------------------------------------------
+defmodule CMS.MetaNode do
+  @moduledoc """
+  Factory for creating Meta-Nodes (nodes about nodes).
+  """
+
+  # FIX: Removed unused Edge alias
+  alias CMS.Node
+
+  @spec spawn_conflict(String.t(), map()) :: {:ok, CMS.Node.t()}
+  def spawn_conflict(description, context_data) do
+    head_text = "CONFLICT DETECTED: #{description}"
+    data_head = CMS.DataHead.new(head_text)
+
+    payload = %CMS.DataBodyPayload.Object{type: :object, object_type: :conflict_context, data: context_data}
+    data_tail = CMS.DataTail.new(1.0, [], ["system", "root"])
+    body = CMS.NodeBody.new(data_head, [payload], data_tail)
+
+    {:ok, embedding} = CMS.Tool.Embedder.generate(head_text, "all-MiniLM-L6-v2")
+    head = CMS.NodeHead.new(embedding, "all-MiniLM-L6-v2", 0.99)
+
+    provenance = %{source: "CMS.IngestionEngine", method: "dialectical_merge"}
+    Node.new(head, body, provenance)
+  end
+end
+
+
+------------------------------------------------------------
+File: ingestion_engine.ex
+------------------------------------------------------------
+defmodule CMS.IngestionEngine do
+  use GenServer
+  require Logger
+
+  alias CMS.{Node, VectorRouter, LogAppender, NodeSupervisor, Security, MetaNode, Edge}
+
+  @moduledoc """
+  The Gatekeeper. Orchestrates the Zero-Friction Ingestion Protocol.
+
+  Implements:
+  - Gap 4: Conflict Detection & Trust-Based Arbitration.
+  - Plan Step 7: Automated Association (Hebbian Priming).
+
+  Responsibilities:
+  1. Validate incoming data payloads (FIDs).
+  2. Enforce Security (ACLs).
+  3. Generate Embeddings & Salience Scores.
+  4. Detect Conflicts via Vector Search & Trust Scores.
+  5. Finalize Persistence (Log, Index, Spawn).
+  """
+
+  # Configuration
+  @max_associative_links 5       # Max number of non-conflict links to prime
+  @min_associative_score 0.60    # Min score to consider for a semantic link
+  @conflict_similarity_threshold 0.98
+  @trust_supersede_threshold 0.2 # If new node is > 0.2 more trusted, it wins.
+
+  def start_link(_opts) do
+    GenServer.start_link(__MODULE__, :ok, name: __MODULE__)
+  end
+
+  @doc """
+  Ingests a new atomic thought/fact into the CMS.
+
+  Returns {:ok, node_id} or {:ok, :ingested_with_conflict_resolution, meta_id} or {:error, reason}.
+  """
+  def ingest(request) do
+    # Timeout increased to 30s to allow for Embedding generation and Disk I/O
+    GenServer.call(__MODULE__, {:ingest, request}, 30_000)
+  end
+
+  # Callbacks
+
+  @impl true
+  def init(:ok) do
+    {:ok, %{}}
+  end
+
+  @impl true
+  def handle_call({:ingest, req}, _from, state) do
+    # Step 1: Validation & Security
+    with :ok <- validate_payloads(req.description_payloads),
+         true <- Security.can_write?(req.agent_id, req.acls || ["public"]) do
+
+      # Step 2: Embedding & Identity Construction
+      # We default to the standard model version
+      {:ok, embedding} = CMS.Tool.Embedder.generate(req.fact_text, "all-MiniLM-L6-v2")
+
+      node_head = CMS.NodeHead.new(embedding, "all-MiniLM-L6-v2")
+      data_head = CMS.DataHead.new(req.fact_text)
+
+      # Calculate Salience (Hooked up from SalienceEngine)
+      salience = CMS.SalienceEngine.calculate(req.fact_text, req.provenance || %{})
+
+      # *** IMPLEMENTATION: HEBBIAN PRIMING (Fix 1) ***
+      # Fetch initial associative links *before* creating the DataTail
+      # This connects the new node to the existing knowledge graph immediately.
+      {:ok, initial_edges} = prime_initial_edges(embedding, "all-MiniLM-L6-v2")
+
+      data_tail = CMS.DataTail.new(salience, initial_edges, req.acls || ["public"])
+
+      node_body = CMS.NodeBody.new(data_head, req.description_payloads, data_tail)
+
+      # Create Node Struct (ID is derived here via Content Addressability)
+      {:ok, new_node} = Node.new(node_head, node_body, req.provenance)
+
+      # Step 3: Conflict Detection & Trust Arbitration (Fix 4)
+      # We check if a very similar node already exists
+      case check_for_conflict(new_node) do
+        {:conflict, existing_id} ->
+          # Trigger Trust-Based Arbitration
+          result = resolve_conflict_with_arbitration(new_node, existing_id)
+          {:reply, result, state}
+
+        :ok ->
+          # Step 4: Finalize & Activate
+          result = finalize_ingestion(new_node)
+          {:reply, result, state}
+      end
+
+    else
+      false -> {:reply, {:error, :permission_denied}, state}
+      error -> {:reply, error, state}
+    end
+  end
+
+  # Internals
+
+  defp validate_payloads(payloads) do
+    Enum.reduce_while(payloads, :ok, fn payload, _acc ->
+      case CMS.FIDValidator.validate(payload) do
+        :ok -> {:cont, :ok}
+        err -> {:halt, err}
+      end
+    end)
+  end
+
+  # --- FIX 1: Automated Association / Hebbian Priming Logic ---
+  defp prime_initial_edges(embedding, model_version) do
+    # Query VectorRouter for top N semantic neighbors
+    query_result = VectorRouter.query(
+      embedding,
+      model_version,
+      k: @max_associative_links
+    )
+
+    case query_result do
+      {:ok, candidates} ->
+        edges = candidates
+        |> Enum.filter(fn {_id, score} -> score >= @min_associative_score end)
+        |> Enum.map(fn {target_id, score} ->
+          # Use score as the initial weight for the semantic link
+          Edge.new(target_id, :semantic, score)
+        end)
+
+        {:ok, edges}
+
+      {:error, reason} ->
+        Logger.warning("VectorRouter failed to prime edges: #{inspect(reason)}. Continuing with no initial links.")
+        {:ok, []}
+    end
+  end
+  # ------------------------------------------------------------------------
+
+
+  defp check_for_conflict(new_node) do
+    # Query VectorRouter for very high similarity neighbors
+    query_result = VectorRouter.query(
+      new_node.head.embedding,
+      new_node.head.embedding_model_version,
+      k: 1, # Top 1
+      threshold: @conflict_similarity_threshold # Only look for nearly identical matches
+    )
+
+    case query_result do
+      {:ok, candidates} ->
+        case candidates do
+          [{existing_id, _score} | _] ->
+            # High vector similarity found.
+            if new_node.id == existing_id do
+              # Exact duplicate content (ID matches). Idempotent.
+              :ok
+            else
+              # Different ID but almost identical meaning -> Potential Conflict.
+              {:conflict, existing_id}
+            end
+          _ ->
+            :ok
+        end
+
+      {:error, _reason} ->
+        # If the index is empty or fails, we assume no conflict exists.
+        :ok
+    end
+  end
+
+  # --- FIX 4: Trust-Based Arbitration & Dialectical Merge ---
+  defp resolve_conflict_with_arbitration(new_node, existing_id) do
+    Logger.info("Potential conflict detected between New Node #{new_node.id} and Existing #{existing_id}")
+
+    # 1. Fetch Provenance of Existing Node
+    existing_trust = get_node_trust_score(existing_id)
+    # FIX: Use Map.get safely for provenance as struct definition might vary
+    new_provenance = Map.get(new_node, :provenance, %{})
+    new_trust = Map.get(new_provenance, "trust_score", 0.5)
+
+    trust_diff = new_trust - existing_trust
+
+    cond do
+      # Case A: New node is significantly more trusted -> SUPERSEDE
+      trust_diff > @trust_supersede_threshold ->
+        handle_supersedence(new_node, existing_id)
+
+      # Case B: Trust is similar or Old node is trusted more -> DIALECTICAL MERGE
+      true ->
+        handle_dialectical_merge(new_node, existing_id)
+    end
+  end
+
+  defp get_node_trust_score(node_id) do
+    # Attempt to get trust score from active actor
+    case NodeSupervisor.get_node_pid(node_id) do
+      nil ->
+        # Node not active, fetch from history (expensive fallback)
+        case CMS.TemporalQueryEngine.get_node_state_at_time(node_id, DateTime.utc_now()) do
+          {:ok, node} ->
+            prov = Map.get(node, :provenance, %{})
+            Map.get(prov, "trust_score", 0.5)
+          _ -> 0.5
+        end
+      pid ->
+        # FIX: Explicit GenServer Call to the NodeActor
+        try do
+          GenServer.call(pid, :get_trust_score, 1000)
+        catch
+          # If node crashes or times out during arbitration, default to neutral
+          :exit, _ -> 0.5
+        end
+    end
+  end
+
+  defp handle_supersedence(new_node, existing_id) do
+    Logger.info("Arbitration: New Node #{new_node.id} supersedes #{existing_id} (Trust Diff > #{@trust_supersede_threshold})")
+
+    # 1. Update Existing Node: Mark as superseded
+    superseded_edge = Edge.new(new_node.id, :superseded_by, 1.0)
+
+    if pid = NodeSupervisor.get_node_pid(existing_id) do
+       GenServer.cast(pid, {:add_edge, superseded_edge})
+       # Log the deprecation event
+       LogAppender.append_node_event(existing_id, :node_updated, %{reason: "superseded", by: new_node.id})
+    end
+
+    # 2. Update New Node: Link back to old (lineage)
+    supersedes_edge = Edge.new(existing_id, :supersedes, 1.0)
+
+    updated_edges = [supersedes_edge | new_node.body.data_tail.relationship_metadata]
+    updated_tail = %{new_node.body.data_tail | relationship_metadata: updated_edges}
+    final_node = %{new_node | body: %{new_node.body | data_tail: updated_tail}}
+
+    # 3. Finalize
+    finalize_ingestion(final_node)
+  end
+
+  defp handle_dialectical_merge(new_node, existing_id) do
+    Logger.warning("Arbitration: Ambiguous trust. Initiating Dialectical Merge between #{new_node.id} and #{existing_id}")
+
+    # 1. Spawn MetaNode to document the conflict
+    context = %{
+      node_a: new_node.id,
+      node_b: existing_id,
+      reason: "High Semantic Similarity / Content Divergence"
+    }
+    {:ok, meta_node} = MetaNode.spawn_conflict("Semantic Conflict Detected", context)
+
+    # 2. Modify New Node: Add edges to MetaNode and the Conflicting Node
+
+    # Edge to MetaNode
+    edge_to_meta = Edge.new(meta_node.id, :semantic, 0.9)
+
+    # Edge to Conflicting Node (CRITICAL: Explicit Link Typing)
+    edge_to_existing = Edge.new(existing_id, :contradicts, 1.0)
+
+    # Filter out the conflicting node if it was accidentally primed as a semantic link
+    updated_edges =
+      new_node.body.data_tail.relationship_metadata
+      |> Enum.filter(fn edge -> edge.target_node_id != existing_id end)
+      |> Kernel.++([edge_to_meta, edge_to_existing])
+
+    updated_tail = %{new_node.body.data_tail | relationship_metadata: updated_edges}
+    updated_body = %{new_node.body | data_tail: updated_tail}
+    final_node = %{new_node | body: updated_body}
+
+    # 3. Finalize MetaNode
+    finalize_ingestion(meta_node)
+
+    # Asynchronously update the *existing* node to link back
+    if pid = NodeSupervisor.get_node_pid(existing_id) do
+      # Edge from existing node to the new node
+      GenServer.cast(pid, {:add_edge, Edge.new(final_node.id, :contradicts, 1.0)})
+      # Edge from existing node to the meta-node
+      GenServer.cast(pid, {:add_edge, Edge.new(meta_node.id, :semantic, 0.9)})
+    end
+
+    finalize_ingestion(final_node)
+
+    {:ok, :ingested_with_conflict_resolution, meta_node.id}
+  end
+
+  defp finalize_ingestion(node) do
+    # 1. Persist to Epoch Log (Immutable History)
+    LogAppender.append_node_event(node.id, :node_created, node)
+
+    # 2. Add to Vector Index (Searchable)
+    VectorRouter.add_embedding(node.id, node.head.embedding, node.head.embedding_model_version)
+
+    # 3. Spawn NodeActor (Active Memory)
+    case NodeSupervisor.start_child(node) do
+      {:ok, _pid} -> {:ok, node.id}
+      {:error, {:already_started, _}} -> {:ok, node.id} # Idempotency
+      err -> err
+    end
+  end
+end
+
+
+================================================================================
+Folder: cms/agents
+================================================================================
+
+------------------------------------------------------------
+File: query_coordinator.ex
+------------------------------------------------------------
+defmodule CMS.QueryCoordinator do
+  use GenServer
+  require Logger
+
+  alias CMS.LogAppender # Added LogAppender alias for failure reporting
+
+  @moduledoc """
+  Orchestrates the lifecycle of a single query.
+
+  Implements Gap 1: Global Inhibition / Winner-Takes-Most (WTM).
+
+  It collects results from responding NodeActors. If too many nodes fire ("Cognitive Overload"),
+  it broadcasts an :inhibit signal to prune the search tree.
+  """
+
+  # Configuration
+  @top_k_results 50             # Only care about top 50 relevant nodes
+  @inhibit_threshold_count 100  # If >100 nodes fire, trigger inhibition
+  @query_timeout 5_000          # Max time to wait for results
+  @inhibit_check_delay 150      # Check for explosion 150ms after start
+
+  # State
+  defstruct [
+    :query_id,
+    :origin_pid,
+    :target_regions,
+    :fired_nodes,    # Map: %{node_id => {relevance, node_data}}
+    :top_k_list,     # List: [{relevance, node_id}, ...] sorted desc
+    :active_regions, # MapSet of regions pending completion
+    :inhibited?      # Boolean
+  ]
+
+  # API
+  # ... (start_link, node_fired, region_complete remain unchanged)
+
+  @doc """
+  Starts a coordinator for a specific query.
+  """
+  def start_link(query_id, target_regions, origin_pid) do
+    GenServer.start_link(__MODULE__, {query_id, target_regions, origin_pid}, name: via_tuple(query_id))
+  end
+
+  @doc """
+  Called by a NodeActor when it decides to fire.
+  """
+  def node_fired(query_id, node_id, relevance, node_data) do
+    case Registry.lookup(CMS.QueryCoordinatorRegistry, query_id) do
+      [{pid, _}] -> GenServer.cast(pid, {:node_fired, node_id, relevance, node_data})
+      [] -> :ok # Coordinator died or timed out, ignore
+    end
+  end
+
+  @doc """
+  Called by the BusPipeline when a region has finished processing the initial broadcast.
+  """
+  def region_complete(query_id, region_id) do
+    case Registry.lookup(CMS.QueryCoordinatorRegistry, query_id) do
+      [{pid, _}] -> GenServer.cast(pid, {:region_complete, region_id})
+      [] -> :ok
+    end
+  end
+
+  # Callbacks
+
+  @impl true
+  def init({query_id, target_regions, origin_pid}) do
+    # Fail-safe timeout
+    Process.send_after(self(), :timeout, @query_timeout)
+
+    # Rapid inhibition check
+    Process.send_after(self(), :check_inhibition, @inhibit_check_delay)
+
+    {:ok, %__MODULE__{
+      query_id: query_id,
+      origin_pid: origin_pid,
+      target_regions: target_regions,
+      active_regions: MapSet.new(target_regions),
+      fired_nodes: %{},
+      top_k_list: [],
+      inhibited?: false
+    }}
+  end
+
+  @impl true
+  def handle_cast({:node_fired, node_id, relevance, node_data}, state) do
+    # 1. Store Result
+    new_fired = Map.put(state.fired_nodes, node_id, {relevance, node_data})
+
+    # 2. Update Top-K (Insertion Sort / limited list)
+    new_top_k = update_top_k(state.top_k_list, {relevance, node_id})
+
+    # 3. Check Immediate Overload
+    if not state.inhibited? and map_size(new_fired) > @inhibit_threshold_count do
+      trigger_inhibition(state.query_id, state.active_regions)
+      # CRITICAL PATCH: Log overload failure
+      report_query_failure(state, :cognitive_overload)
+      {:noreply, %{state | fired_nodes: new_fired, top_k_list: new_top_k, inhibited?: true}}
+    else
+      {:noreply, %{state | fired_nodes: new_fired, top_k_list: new_top_k}}
+    end
+  end
+
+  @impl true
+  def handle_cast({:region_complete, region_id}, state) do
+    new_active = MapSet.delete(state.active_regions, region_id)
+
+    if MapSet.size(new_active) == 0 do
+      finalize_query(state)
+      {:stop, :normal, state}
+    else
+      {:noreply, %{state | active_regions: new_active}}
+    end
+  end
+
+  @impl true
+  def handle_info(:check_inhibition, state) do
+    # If we have a lot of results early on, prune the rest of the search.
+    if not state.inhibited? and map_size(state.fired_nodes) > (@inhibit_threshold_count / 2) do
+      Logger.debug("Coordinator #{state.query_id}: Fast inhibition triggered.")
+      trigger_inhibition(state.query_id, state.active_regions)
+      # CRITICAL PATCH: Log fast overload warning
+      report_query_failure(state, :rapid_inhibition)
+      {:noreply, %{state | inhibited?: true}}
+    else
+      {:noreply, state}
+    end
+  end
+
+  @impl true
+  def handle_info(:timeout, state) do
+    # CRITICAL PATCH: Report explicit failure and finish with partial results
+    Logger.warning("Coordinator #{state.query_id} timed out.")
+    report_query_failure(state, :timeout)
+    finalize_query(state)
+    {:stop, :normal, state}
+  end
+
+  # Internals
+
+  defp trigger_inhibition(query_id, active_regions) do
+    # Broadcast :inhibit to all active regions via PubSub
+    Enum.each(active_regions, fn region_id ->
+      Phoenix.PubSub.broadcast(CMS.PubSub, "region:#{region_id}", {:inhibit, query_id})
+    end)
+  end
+
+  defp report_query_failure(state, reason) do
+    LogAppender.append_system_event(:query_failure, %{
+      query_id: state.query_id,
+      reason: reason,
+      origin_pid: state.origin_pid,
+      fired_node_count: map_size(state.fired_nodes),
+      active_regions: MapSet.to_list(state.active_regions)
+    })
+  end
+
+  defp finalize_query(state) do
+    # Map top_k IDs back to full data
+    results =
+      state.top_k_list
+      |> Enum.map(fn {_score, id} -> Map.get(state.fired_nodes, id) end)
+      |> Enum.reject(&is_nil/1) # Safety check
+
+    # Send back to requestor
+    send(state.origin_pid, {:query_result, state.query_id, results})
+  end
+
+  defp update_top_k(list, new_entry) do
+    [new_entry | list]
+    |> Enum.sort_by(fn {score, _} -> score end, :desc)
+    |> Enum.take(@top_k_results)
+  end
+
+  defp via_tuple(query_id) do
+    {:via, Registry, {CMS.QueryCoordinatorRegistry, query_id}}
+  end
+end
+
+
+------------------------------------------------------------
+File: activation_engine.ex
+------------------------------------------------------------
+defmodule CMS.ActivationEngine do
+  use GenServer
+  require Logger
+
+  @moduledoc """
+  Manages the Global Inhibition Mechanism.
+
+  Implements Gap 16: Global Inhibition Signal / System Congestion.
+
+  It maintains a public ETS table containing the current 'inhibition_factor'.
+  NodeActors read this factor to modulate their Spreading Activation gain.
+  High Congestion -> Low Factor -> Weaker Pulses -> Less Traffic.
+  """
+
+  # Constants
+  @table_name :cms_global_inhibition_factor_ets
+  @key :factor
+  @default_factor 1.0 # 1.0 = Full Energy, 0.0 = Total Inhibition
+  @congestion_topic "system_congestion"
+
+  # API
+
+  def start_link(_opts) do
+    GenServer.start_link(__MODULE__, :ok, name: __MODULE__)
+  end
+
+  @doc """
+  Retrieves the current global inhibition factor (0.0 to 1.0).
+  This is a high-frequency read operation optimized via ETS.
+  """
+  @spec get_global_inhibition_factor() :: float()
+  def get_global_inhibition_factor do
+    case :ets.lookup(@table_name, @key) do
+      [{@key, value}] -> value
+      _ -> @default_factor
+    end
+  end
+
+  @doc """
+  Injects a simulated congestion level for testing or external monitoring tools.
+  Level: 0.0 (Idle) to 1.0 (Critical Load).
+  """
+  def set_congestion_level(level) do
+    GenServer.cast(__MODULE__, {:congestion_level, level})
+  end
+
+  # Callbacks
+
+  @impl true
+  def init(:ok) do
+    # Create public ETS table for read-heavy access by NodeActors
+    :ets.new(@table_name, [:set, :public, :named_table, {:read_concurrency, true}])
+    :ets.insert(@table_name, {@key, @default_factor})
+
+    # Subscribe to system stats (e.g., from a LiveWire Agent or Telemetry)
+    Phoenix.PubSub.subscribe(CMS.PubSub, @congestion_topic)
+
+    Logger.info("CMS.ActivationEngine started. Global Factor: #{@default_factor}")
+    {:ok, %{current_congestion: 0.0}}
+  end
+
+  @impl true
+  def handle_cast({:congestion_level, level}, state) do
+    new_factor = calculate_inhibition(level)
+    update_ets(new_factor)
+    {:noreply, %{state | current_congestion: level}}
+  end
+
+  @impl true
+  def handle_info({:system_congestion, level}, state) do
+    new_factor = calculate_inhibition(level)
+    update_ets(new_factor)
+    Logger.debug("System Congestion #{level} -> Inhibition Factor #{new_factor}")
+    {:noreply, %{state | current_congestion: level}}
+  end
+
+  # Internals
+
+  defp calculate_inhibition(congestion) do
+    # Linear degradation:
+    # Congestion 0.0 -> Factor 1.0
+    # Congestion 1.0 -> Factor 0.1 (Never fully 0 to allow critical alerts)
+
+    clamped_congestion = max(0.0, min(1.0, congestion))
+    max(0.1, 1.0 - (clamped_congestion * 0.9))
+  end
+
+  defp update_ets(factor) do
+    :ets.insert(@table_name, {@key, factor})
+  end
+end
+
+
+------------------------------------------------------------
+File: node_supervisor.ex
+------------------------------------------------------------
+defmodule CMS.NodeSupervisor do
+  use DynamicSupervisor
+  require Logger
+
+  @moduledoc """
+  Manages the lifecycle of all CMS.NodeActor processes.
+
+  Responsibilities:
+  1. Starts NodeActors dynamically upon Ingestion or Cold Boot.
+  2. Restarts transient failures.
+  3. Provides lookup utilities (PID retrieval).
+  """
+
+  def start_link(opts) do
+    DynamicSupervisor.start_link(__MODULE__, opts, name: __MODULE__)
+  end
+
+  @impl true
+  def init(_opts) do
+    DynamicSupervisor.init(strategy: :one_for_one)
+  end
+
+  @doc """
+  Spawns a new NodeActor for the given Node struct.
+  """
+  @spec start_child(CMS.Node.t()) :: {:ok, pid()} | {:error, any()}
+  def start_child(%CMS.Node{} = node) do
+    child_spec = %{
+      id: node.id, # Not strictly used by DynamicSup, but good practice
+      start: {CMS.NodeActor, :start_link, [node]},
+      restart: :transient # Restart if crash, but not if normal shutdown (Decay)
+    }
+    DynamicSupervisor.start_child(__MODULE__, child_spec)
+  end
+
+  @doc """
+  Retrieves the PID of a running NodeActor by its Content-Addressable ID.
+  """
+  @spec get_node_pid(String.t()) :: pid() | nil
+  def get_node_pid(node_id) do
+    case Registry.lookup(CMS.NodeRegistry, node_id) do
+      [{pid, _}] -> pid
+      [] -> nil
+    end
+  end
+
+  @doc """
+  Returns a list of all active Node PIDs.
+  Used by DecayManager and ModelDriftManager.
+  """
+  def get_all_active_node_pids do
+    # Get all PIDs registered in the NodeRegistry
+    Registry.select(CMS.NodeRegistry, [{{:_, :"$1", :_}, [], [:"$1"]}])
+  end
+end
+
+
+------------------------------------------------------------
+File: node_actor.ex
+------------------------------------------------------------
+defmodule CMS.NodeActor do
+  use GenServer
+  require Logger
+
+  # FIX: Cleaned up aliases and ensured they are used
+  alias CMS.{Node, ActivationEngine, QueryCoordinator, RegionalHebbianBuffer, LogAppender, SemanticRegion, TemporalQueryEngine}
+  alias CMS.Edge
+  alias CMS.Security
+  alias CMS.Tool.Embedder
+
+  @moduledoc """
+  The Atomic Unit of Cognition (The "Neuron").
+
+  Implements:
+  - Fix 2: State Hydration (Crash Amnesia Fix).
+  - Gap 11.4: Node Migration.
+  - Section 7.2: Hebbian & Anti-Hebbian Learning.
+  - Section 8.2: Model Drift Handling.
+  """
+
+  @abnormality_topic "global:abnormality_signal"
+
+  defstruct [:node, :region_id, :hydrated?]
+
+  def start_link(%Node{} = node) do
+    GenServer.start_link(__MODULE__, node, name: via_tuple(node.id))
+  end
+
+  @impl true
+  def init(node) do
+    # 1. Subscribe to Semantic Region
+    region_id = SemanticRegion.compute_region_hash(node.head.embedding, node.head.embedding_model_version)
+    SemanticRegion.subscribe(region_id, node.id)
+
+    # 2. FIX 2: Schedule State Hydration
+    Process.send_after(self(), :hydrate, 10)
+
+    {:ok, %__MODULE__{node: node, region_id: region_id, hydrated?: false}}
+  end
+
+  # --- FIX 2: Hydration Logic ---
+  @impl true
+  def handle_info(:hydrate, state) do
+    Logger.debug("NodeActor #{state.node.id}: Attempting hydration from Temporal History...")
+
+    case TemporalQueryEngine.get_node_state_at_time(state.node.id, DateTime.utc_now()) do
+      {:ok, restored_node_map} ->
+        # Simplified merge logic assuming struct compatibility
+        restored_node = struct(CMS.Node, restored_node_map)
+
+        Logger.info("NodeActor #{state.node.id}: Hydrated successfully.")
+        {:noreply, %{state | node: restored_node, hydrated?: true}}
+
+      {:error, _reason} ->
+        Logger.debug("NodeActor #{state.node.id}: No history found. Starting fresh.")
+        {:noreply, %{state | hydrated?: true}}
+    end
+  end
+
+  # --- Standard Bus Handlers ---
+
+  @impl true
+  def handle_info({:query, context}, state) do
+    if state.hydrated? do
+      if MapSet.member?(context.trace, state.node.id) do
+        {:noreply, state}
+      else
+        process_activation(:primary, context, state, 0.0)
+      end
+    else
+      {:noreply, state}
+    end
+  end
+
+  @impl true
+  def handle_info({:pulse, payload}, state) do
+    %{query_context: context, ttl: ttl, trace: trace, boost_score: boost, origin_id: origin_id} = payload
+
+    # GAP 9 FIX: Handle :infinity atom explicitly
+    is_dead_pulse = (is_integer(ttl) and ttl <= 0)
+
+    if is_dead_pulse or MapSet.member?(trace, state.node.id) do
+      {:noreply, state}
+    else
+      reinforce_link(state.node, origin_id, state.region_id)
+      process_activation(:secondary, context, state, boost, ttl)
+    end
+  end
+
+  # --- GenServer Calls ---
+
+  @impl true
+  def handle_call(:get_drift_info, _from, state) do
+    result = {state.node.id, state.node.head.embedding, state.node.head.embedding_model_version, state.region_id}
+    {:reply, result, state}
+  end
+
+  @impl true
+  def handle_call(:get_head_info, _from, state) do
+    {:reply, state.node.head, state}
+  end
+
+  @impl true
+  def handle_call(:get_decay_criteria, _from, state) do
+    node = state.node
+    total_link_weight = calculate_total_link_weight(node)
+    {:reply, {node.head.internal_state, total_link_weight}, state}
+  end
+
+  @impl true
+  def handle_call(:get_trust_score, _from, state) do
+    trust = Map.get(state.node, :provenance, %{}) |> Map.get("trust_score", 0.5)
+    {:reply, trust, state}
+  end
+
+  # --- GenServer Casts (Expanded for Completeness) ---
+
+  @impl true
+  def handle_cast(:perform_differential_decay, state) do
+    now = DateTime.utc_now()
+
+    # 1. Decay Edges
+    new_edges = Enum.map(state.node.body.data_tail.relationship_metadata, fn edge ->
+      hours_unused = DateTime.diff(now, edge.last_used_at, :hour)
+      if hours_unused > 24 do
+        %{edge | weight: max(0.01, edge.weight - (0.01 * (hours_unused / 24.0)))}
+      else
+        edge
+      end
+    end)
+
+    # 2. Update Metabolic State
+    days_since_fired = DateTime.diff(now, state.node.last_fired, :day)
+    frequency = state.node.antenna.activation_frequency
+
+    new_internal_state = cond do
+      days_since_fired > 30 and frequency < 0.1 -> :hibernating
+      days_since_fired > 7 -> :low_energy
+      frequency > 0.5 -> :high_energy
+      true -> :recovering
+    end
+
+    new_node = %{state.node |
+      head: %{state.node.head | internal_state: new_internal_state},
+      body: %{state.node.body | data_tail: %{state.node.body.data_tail | relationship_metadata: new_edges}}
+    }
+
+    LogAppender.append_node_event(state.node.id, :node_updated, new_node)
+    {:noreply, %{state | node: new_node}}
+  end
+
+  @impl true
+  def handle_cast({:add_edge, new_edge}, state) do
+    current_edges = state.node.body.data_tail.relationship_metadata
+
+    updated_edges =
+      case Enum.find_index(current_edges, fn e -> e.target_node_id == new_edge.target_node_id end) do
+        nil -> [new_edge | current_edges]
+        idx -> List.replace_at(current_edges, idx, new_edge)
+      end
+
+    updated_tail = %{state.node.body.data_tail | relationship_metadata: updated_edges}
+    new_node = %{state.node | body: %{state.node.body | data_tail: updated_tail}}
+
+    LogAppender.append_node_event(new_node.id, :node_updated, new_node)
+    {:noreply, %{state | node: new_node}}
+  end
+
+  @impl true
+  def handle_cast({:update_region, new_region}, state) do
+    {:noreply, %{state | region_id: new_region}}
+  end
+
+  # --- NEW: Anti-Hebbian Penalization (Gap C) ---
+  @impl true
+  def handle_cast({:feedback, :irrelevant, _context_id, penalization_amount}, state) do
+    # Penalize recent links. For simplicity, we reduce all active link weights.
+    current_edges = state.node.body.data_tail.relationship_metadata
+
+    updated_edges = Enum.map(current_edges, fn edge ->
+      # Reduce weight, clamping at 0.01
+      new_weight = max(0.01, edge.weight - penalization_amount)
+      %{edge | weight: new_weight}
+    end)
+
+    updated_tail = %{state.node.body.data_tail | relationship_metadata: updated_edges}
+    new_node = %{state.node | body: %{state.node.body | data_tail: updated_tail}}
+
+    LogAppender.append_node_event(state.node.id, :node_updated, new_node)
+    {:noreply, %{state | node: new_node}}
+  end
+
+  # --- NEW: Model Drift Repair (Gap 7) ---
+  @impl true
+  def handle_cast({:re_embed_request, active_model}, state) do
+    Logger.info("NodeActor #{state.node.id}: Re-embedding self to model #{active_model}...")
+
+    # 1. Generate new embedding
+    case Embedder.generate(state.node.body.data_head.fact, active_model) do
+      {:ok, new_embedding} ->
+         new_head = %{state.node.head |
+           embedding: new_embedding,
+           embedding_model_version: active_model
+         }
+
+         # 2. Trigger self-update via cast
+         GenServer.cast(self(), {:update_node_head, new_head})
+
+      {:error, reason} ->
+         Logger.error("NodeActor #{state.node.id}: Re-embedding failed: #{inspect(reason)}")
+    end
+
+    {:noreply, state}
+  end
+
+  @impl true
+  def handle_cast({:update_node_head, new_head}, state) do
+    new_node = %{state.node | head: new_head}
+
+    # Recalculate region since embedding changed
+    new_region = SemanticRegion.compute_region_hash(new_head.embedding, new_head.embedding_model_version)
+
+    # Update Subscription if region changed
+    if new_region != state.region_id do
+      SemanticRegion.unsubscribe(state.region_id, state.node.id)
+      SemanticRegion.subscribe(new_region, state.node.id)
+    end
+
+    LogAppender.append_node_event(state.node.id, :node_updated, new_node)
+    {:noreply, %{state | node: new_node, region_id: new_region}}
+  end
+
+  # --- Internal Logic ---
+
+  defp rules do
+    [
+      {:critical_fact_alert, fn node, _context, score ->
+        score > 0.95 and String.contains?(node.body.data_head.fact, "CRITICAL")
+      end},
+      {:untrusted_agent_high_score, fn _node, context, score ->
+        score > 0.90 and Map.get(context, :agent_trust_level, 1.0) < 0.5
+      end},
+      {:emergency_mode_activation, fn _node, context, _score ->
+        Map.get(context, :system_mode) == :emergency
+      end}
+    ]
+  end
+
+  defp process_activation(type, context, state, boost, ttl \\ 0) do
+    node = state.node
+
+    cost = case node.head.internal_state do
+      :high_energy -> 0.9
+      :low_energy -> 1.2
+      :hibernating -> 1.5
+      _ -> 1.0
+    end
+
+    inhibit = ActivationEngine.get_global_inhibition_factor()
+    threshold = (node.head.relevance_threshold / max(0.1, inhibit)) * cost
+
+    relevance = calculate_relevance(node, context)
+    total = relevance + boost
+
+    check_for_abnormality(node, context, total)
+
+    if total >= threshold do
+      # FIX: Restored Security Check using alias Security
+      if Security.can_read?(context.agent_id, node.body.data_tail.acls) do
+        fire_node(type, total, context, state, ttl)
+      else
+        Logger.debug("Node #{node.id} suppressed. Agent #{context.agent_id} denied by ACLs.")
+        {:noreply, state}
+      end
+    else
+      {:noreply, state}
+    end
+  end
+
+  defp check_for_abnormality(node, context, score) do
+    Enum.each(rules(), fn {rule_name, check_fn} ->
+      if check_fn.(node, context, score) do
+        Logger.error("Node #{node.id} triggered Abnormality Signal (Rule: #{rule_name}).")
+        Phoenix.PubSub.broadcast(CMS.PubSub, @abnormality_topic, {
+          :abnormality_signal,
+          node_id: node.id,
+          reason: rule_name,
+          query_id: Map.get(context, :query_id)
+        })
+      end
+    end)
+  end
+
+  defp fire_node(type, score, context, state, incoming_ttl) do
+    node = state.node
+    # 1. Update last_fired and internal state
+    new_node = %{node | last_fired: DateTime.utc_now(), head: %{node.head | internal_state: :high_energy}}
+
+    # 2. Reply to Coordinator
+    if type == :primary or score > 0.90, do: QueryCoordinator.node_fired(context.query_id, node.id, score, new_node)
+
+    # 3. Broadcast Pulse (Spreading Activation)
+    # GAP 9 FIX: Calculate base_ttl handling :infinity for dependencies
+    base_ttl =
+      cond do
+        type == :primary -> 2
+        incoming_ttl == :infinity -> :infinity
+        true -> incoming_ttl - 1
+      end
+
+    # Calculate the standard decay TTL based on antenna gain
+    standard_out_ttl =
+      if base_ttl == :infinity do
+        :infinity
+      else
+        round(base_ttl * node.antenna.gain)
+      end
+
+    # Check if we should propagate at all (either infinite or > 0)
+    if standard_out_ttl == :infinity or standard_out_ttl > 0 do
+      new_trace = MapSet.put(context.trace, node.id)
+
+      Enum.each(node.body.data_tail.relationship_metadata, fn edge ->
+        # Filter weak links
+        if edge.weight > 0.1 do
+          # GAP 9 FIX: Override TTL for dependency links
+          edge_specific_ttl =
+            if edge.type == :dependency do
+              :infinity
+            else
+              standard_out_ttl
+            end
+
+          # Only broadcast if this specific edge has life
+          if edge_specific_ttl == :infinity or edge_specific_ttl > 0 do
+            boost = calculate_associative_boost(score, edge, context)
+
+            payload = %{
+              query_context: context,
+              ttl: edge_specific_ttl,
+              trace: new_trace,
+              origin_id: node.id,
+              boost_score: boost
+            }
+
+            Phoenix.PubSub.broadcast(CMS.PubSub, "node_pulse:#{edge.target_node_id}", {:pulse, payload})
+          end
+        end
+      end)
+    end
+
+    {:noreply, %{state | node: new_node}}
+  end
+
+  defp calculate_relevance(node, context) do
+    if node.head.embedding_model_version != context.embedding_model do
+      # Penalize model drift heavily
+      0.1
+    else
+      similarity(node, context)
+    end
+  end
+
+  defp similarity(node, context) do
+    if context.query_vector do
+      try do
+        # FIX: Used alias Embedder
+        Nx.dot(node.head.embedding, context.query_vector) |> Nx.to_number()
+      rescue _ -> 0.0 end
+    else
+      String.jaro_distance(node.body.data_head.fact, context.query_text)
+    end
+  end
+
+  @spec calculate_associative_boost(float(), Edge.t(), map()) :: float()
+  defp calculate_associative_boost(current_relevance, edge, context) do
+    type_factor = case edge.type do
+      :dependency -> 1.0
+      :contradicts -> 0.2
+      :semantic -> 0.8
+      :causes -> 0.9
+      _ -> 0.5
+    end
+
+    context_factor = case Map.get(context, :reasoning_mode, :normal) do
+      :brainstorm -> 1.5
+      :precision -> 0.8
+      _ -> 1.0
+    end
+
+    current_relevance * edge.weight * type_factor * context_factor
+  end
+
+  defp calculate_total_link_weight(node) do
+    if Enum.empty?(node.body.data_tail.relationship_metadata) do
+      0.0
+    else
+      node.body.data_tail.relationship_metadata
+      |> Enum.map(&(&1.weight))
+      |> Enum.sum()
+      |> (fn sum -> sum / length(node.body.data_tail.relationship_metadata) end).()
+    end
+  end
+
+  defp reinforce_link(node, target_id, region_id) do
+    if Enum.any?(node.body.data_tail.relationship_metadata, fn e -> e.target_node_id == target_id end) do
+      RegionalHebbianBuffer.buffer_update(node.id, [{target_id, 0.05}], region_id)
+    end
+  end
+
+  defp via_tuple(id), do: {:via, Registry, {CMS.NodeRegistry, id}}
+end
+
+
+================================================================================
+Folder: cms/learning
+================================================================================
+
+------------------------------------------------------------
+File: regional_hebbian_buffer.ex
+------------------------------------------------------------
+defmodule CMS.RegionalHebbianBuffer do
+  use GenServer
+  require Logger
+
+  @moduledoc """
+  A sharded buffer for accumulating Hebbian link weight adjustments.
+
+  Implements Gap 5: Sharded Hebbian Buffer.
+  Uses ETS for high-performance in-memory aggregation before flushing to the immutable log.
+  """
+
+  # Configuration
+  @flush_interval 5_000 # Flush every 5 seconds
+  @max_updates_before_flush 1_000 # Or if we hit 1000 pending updates
+
+  defstruct [:shard_id, :ets_table, :update_count]
+
+  # Client API
+
+  def start_link(shard_id) do
+    name = via_tuple(shard_id)
+    GenServer.start_link(__MODULE__, shard_id, name: name)
+  end
+
+  @doc """
+  Routes an update to the correct shard based on the node's region ID.
+
+  adjustments: List of {target_node_id, weight_delta}
+  e.g., [{"UUID-B", 0.05}, {"UUID-C", -0.01}]
+  """
+  @spec buffer_update(String.t(), list({String.t(), float()}), integer()) :: :ok
+  def buffer_update(source_node_id, adjustments, semantic_region_id) do
+    # Route to shard based on region ID (assuming 32 shards)
+    shard_id = rem(semantic_region_id, 32)
+    GenServer.cast(via_tuple(shard_id), {:buffer, source_node_id, adjustments})
+  end
+
+  # Server Callbacks
+
+  @impl true
+  def init(shard_id) do
+    # Create a named public ETS table for this shard
+    table_name = :"hebbian_buffer_#{shard_id}"
+    ets_table = :ets.new(table_name, [:set, :named_table, :public])
+
+    Logger.info("Hebbian Shard #{shard_id} started. ETS: #{inspect(table_name)}")
+
+    # Schedule flush
+    Process.send_after(self(), :flush, @flush_interval)
+
+    {:ok, %__MODULE__{
+      shard_id: shard_id,
+      ets_table: ets_table,
+      update_count: 0
+    }}
+  end
+
+  @impl true
+  def handle_cast({:buffer, source_id, adjustments}, state) do
+    # Write to ETS.
+    # Key: {source_id, target_id}
+    # Value: Accumulated Delta
+
+    Enum.each(adjustments, fn {target_id, delta} ->
+      key = {source_id, target_id}
+
+      # update_counter is atomic. If key doesn't exist, create it with default.
+      # ETS update_counter usually works with integers. For floats, we must use
+      # :ets.update_element or read/write inside the GenServer serialization.
+      # Since we are inside handle_cast, we are serialized, so read/write is safe here.
+
+      case :ets.lookup(state.ets_table, key) do
+        [{^key, current_delta}] ->
+          :ets.insert(state.ets_table, {key, current_delta + delta})
+        [] ->
+          :ets.insert(state.ets_table, {key, delta})
+      end
+    end)
+
+    new_count = state.update_count + length(adjustments)
+
+    if new_count >= @max_updates_before_flush do
+      do_flush(state.ets_table)
+      {:noreply, %{state | update_count: 0}}
+    else
+      {:noreply, %{state | update_count: new_count}}
+    end
+  end
+
+  @impl true
+  def handle_info(:flush, state) do
+    do_flush(state.ets_table)
+    Process.send_after(self(), :flush, @flush_interval)
+    {:noreply, %{state | update_count: 0}}
+  end
+
+  # Internals
+
+  defp do_flush(table) do
+    # 1. Drain table
+    # This is a critical section. We use tab2list then delete_all.
+    # In a ultra-high concurrency scenario, we might swap tables, but this suffices for now.
+    entries = :ets.tab2list(table)
+    :ets.delete_all_objects(table)
+
+    unless Enum.empty?(entries) do
+      Logger.debug("Flushing #{length(entries)} Hebbian updates to LogAppender.")
+
+      # 2. Group by Source Node for efficient logging
+      # Transform {{source, target}, delta} -> {source, [{target, delta}]}
+      grouped_updates =
+        entries
+        |> Enum.group_by(
+          fn {{source, _target}, _delta} -> source end,
+          fn {{_source, target}, delta} -> {target, delta} end
+        )
+
+      # 3. Send to LogAppender (Step 7)
+      CMS.LogAppender.append_hebbian_updates(grouped_updates)
+    end
+  end
+
+  defp via_tuple(shard_id) do
+    {:global, :"cms_hebbian_shard_#{shard_id}"}
+  end
+end
+
+
+------------------------------------------------------------
+File: model_drift_manager.ex
+------------------------------------------------------------
+defmodule CMS.ModelDriftManager do
+  use GenServer
+  require Logger
+
+  @moduledoc """
+  Monitors and repairs Embedding Model Drift.
+
+  Implements Gap 7.
+  Ensures that nodes using obsolete embedding models are identified
+  and queued for re-embedding to maintain semantic compatibility.
+  """
+
+  # Configuration
+  @check_interval :timer.hours(6)
+
+  # Updated to match the ML Bridge default
+  @active_model_version "all-MiniLM-L6-v2"
+
+  def start_link(_opts) do
+    GenServer.start_link(__MODULE__, :ok, name: __MODULE__)
+  end
+
+  @impl true
+  def init(:ok) do
+    Process.send_after(self(), :check_for_drift, @check_interval)
+    {:ok, %{active_model: @active_model_version}}
+  end
+
+  @impl true
+  def handle_info(:check_for_drift, state) do
+    Logger.info("ModelDriftManager: Scanning active nodes for model version mismatch...")
+
+    # FIX: Select pids (:$1) instead of the whole tuple, and use double quotes for atom
+    # Registry pattern: {{key, pid, value}, guards, [result_shape]}
+    nodes_checked_count =
+      Registry.select(CMS.NodeRegistry, [{{:_, :"$1", :_}, [], [:"$1"]}])
+      |> Enum.map(fn pid ->
+        check_node(pid, state.active_model)
+      end)
+      |> length()
+
+    # FIX: Use the variable for observability
+    Logger.info("ModelDriftManager: Dispatched checks for #{nodes_checked_count} nodes.")
+
+    Process.send_after(self(), :check_for_drift, @check_interval)
+    {:noreply, state}
+  end
+
+  defp check_node(pid, active_model) do
+    # Asynchronously ask the node for its header info
+    Task.start(fn ->
+      try do
+        node_head = GenServer.call(pid, :get_head_info, 5000)
+
+        if node_head.embedding_model_version != active_model do
+          # Trigger self-repair on the node
+          GenServer.cast(pid, {:re_embed_request, active_model})
+        end
+      catch
+        :exit, _ -> :noop # Node died
+      end
+    end)
+  end
+end
+
+
+------------------------------------------------------------
+File: decay_manager.ex
+------------------------------------------------------------
+defmodule CMS.DecayManager do
+  use GenServer
+  require Logger
+
+  @moduledoc """
+  Orchestrates the Active Forgetting and Differential Decay processes.
+
+  CRITICAL UPDATE: Eviction logic is enhanced to use both metabolic state and
+  link strength for a more bio-mimetic 'active forgetting' (Gap 15).
+  """
+
+  # Configuration
+  @decay_cycle_interval :timer.hours(1)
+  @eviction_check_interval :timer.minutes(15)
+  @low_energy_threshold :hibernating
+  @min_eviction_weight 0.1 # New: The maximum average link weight for a node to be evicted
+
+  def start_link(_opts) do
+    GenServer.start_link(__MODULE__, :ok, name: __MODULE__)
+  end
+
+  @impl true
+  def init(:ok) do
+    Process.send_after(self(), :trigger_decay_cycle, @decay_cycle_interval)
+    Process.send_after(self(), :trigger_eviction_check, @eviction_check_interval)
+    {:ok, %{}}
+  end
+
+  # Callbacks
+
+  @impl true
+  def handle_info(:trigger_decay_cycle, state) do
+    Logger.info("DecayManager: Starting global decay cycle.")
+
+    CMS.NodeSupervisor.get_all_active_node_pids()
+    |> Enum.each(fn pid ->
+      GenServer.cast(pid, :perform_differential_decay)
+    end)
+
+    Process.send_after(self(), :trigger_decay_cycle, @decay_cycle_interval)
+    {:noreply, state}
+  end
+
+  @impl true
+  # --- LOGIC UPDATE: Refactored eviction check to use dual criteria ---
+  def handle_info(:trigger_eviction_check, state) do
+    Logger.debug("DecayManager: Auditing nodes for critical low energy and low link strength.")
+
+    count_evicted =
+      CMS.NodeSupervisor.get_all_active_node_pids()
+      |> Enum.count(fn pid ->
+        try do
+          # 1. Use the new GenServer call to get dual criteria
+          # Returns: {:ok, {internal_state, total_link_weight}}
+          {:ok, {internal_state, total_link_weight}} = GenServer.call(pid, :get_decay_criteria, 1000)
+
+          # 2. Check both criteria for eviction
+          if internal_state == @low_energy_threshold and total_link_weight < @min_eviction_weight do
+             Logger.info("Evicting Node due to internal_state: #{internal_state} and total_link_weight: #{total_link_weight}.")
+             # Force stop
+             GenServer.stop(pid, :normal)
+             true
+          else
+             false
+          end
+        catch
+          :exit, _ -> false # Node died during check
+          _, _ -> false # GenServer call failed/timed out
+        end
+      end)
+
+    if count_evicted > 0 do
+      Logger.info("DecayManager: Evicted #{count_evicted} hibernating, low-strength nodes.")
+    end
+
+    Process.send_after(self(), :trigger_eviction_check, @eviction_check_interval)
+    {:noreply, state}
+  end
+end
+
+
+------------------------------------------------------------
+File: hebbian_buffer_supervisor.ex
+------------------------------------------------------------
+defmodule CMS.HebbianBufferSupervisor do
+  use Supervisor
+
+  @shard_count 32
+
+  def start_link(opts) do
+    Supervisor.start_link(__MODULE__, opts, name: __MODULE__)
+  end
+
+  @impl true
+  def init(_opts) do
+    children =
+      for i <- 0..(@shard_count - 1) do
+        %{
+          id: :"hebbian_shard_#{i}",
+          start: {CMS.RegionalHebbianBuffer, :start_link, [i]},
+          restart: :permanent
+        }
+      end
+
+    Supervisor.init(children, strategy: :one_for_one)
+  end
+end
+
+
+================================================================================
+Folder: cms/infrastructure
+================================================================================
+
+================================================================================
+Folder: cms/infrastructure/persistence
+================================================================================
+
+------------------------------------------------------------
+File: vector_router.ex
+------------------------------------------------------------
+defmodule CMS.VectorRouter do
+  use GenServer
+  require Logger
+
+  @moduledoc """
+  Manages the Hierarchical Navigable Small Worlds (HNSW) index for vector embeddings.
+
+  CRITICAL PATCH (Gap 7): Now manages a map of HNSW indices, one for each
+  embedding model version, preventing cross-model interference.
+  """
+
+  # Configuration
+  @base_index_dir "priv/data/hnsw_indices" # New base directory for multiple indices
+  @dim 384
+  @max_elements 100_000
+  @persist_interval :timer.minutes(5)
+  @persist_threshold 100
+
+  # Placeholder for configurable supported models
+  @supported_models ["all-MiniLM-L6-v2", "custom-bert-v1"]
+
+  # --- STRUCT UPDATE ---
+  defstruct [
+    :indices,           # Map: %{model_version => index_ref}
+    :insertion_count,   # Map: %{model_version => count}
+    :dirty_models       # MapSet: Tracks models with unpersisted changes
+  ]
+
+  # Client API
+
+  def start_link(opts \\ []) do
+    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+  end
+
+  def add_embedding(node_id, embedding, model_version) do
+    GenServer.call(__MODULE__, {:add, node_id, embedding, model_version})
+  end
+
+  @doc """
+  Queries the HNSW index for approximate nearest neighbors.
+  Options: :k (default 10), :threshold (min similarity score, default 0.0)
+  """
+  @spec query(Nx.Tensor.t(), String.t(), Keyword.t()) :: {:ok, list({String.t(), float()})} | {:error, any()}
+  def query(query_vector, model_version, opts \\ []) do
+    GenServer.call(__MODULE__, {:query, query_vector, model_version, opts})
+  end
+
+  def persist do
+    GenServer.call(__MODULE__, :persist)
+  end
+
+  # --- New Helper: Determines the file path for a model's index ---
+  defp index_file_path(model_version) do
+    File.mkdir_p!(@base_index_dir)
+    Path.join(@base_index_dir, "#{String.replace(model_version, "-", "_")}.hnsw.bin")
+  end
+
+  # Server Callbacks
+
+  @impl true
+  # --- FUNCTION REFACTOR: init/1 to load/create multiple indices ---
+  def init(_opts) do
+    Logger.info("CMS.VectorRouter: Initializing multi-model HNSW indices.")
+    Process.send_after(self(), :periodic_persist, @persist_interval)
+
+    {initial_indices, initial_counts} =
+      Enum.map(@supported_models, fn model ->
+        case load_index(model) do
+          {:ok, index} ->
+            Logger.info("HNSW index for '#{model}' loaded from disk.")
+            {model, index}
+          {:error, :not_found} ->
+            Logger.info("Creating new HNSW index for '#{model}'.")
+            {:ok, index} = HNSWLib.Index.new(:cosine, @dim, @max_elements)
+            {model, index}
+          {:error, reason} ->
+            Logger.error("Failed to load index for '#{model}': #{inspect(reason)}. Creating new one.")
+            {:ok, index} = HNSWLib.Index.new(:cosine, @dim, @max_elements)
+            {model, index}
+        end
+        |> then(fn {m, i} -> {m, i} end)
+        |> then(fn {m, i} -> {{m, i}, {m, 0}} end)
+      end)
+      |> Enum.unzip()
+
+    {:ok, %__MODULE__{
+      indices: Map.new(initial_indices),
+      insertion_count: Map.new(initial_counts),
+      dirty_models: MapSet.new()
+    }}
+  end
+
+  @impl true
+  # --- LOGIC REFACTOR: handle_call({:add, ...}) now uses the correct index ---
+  def handle_call({:add, node_id, embedding, model_version}, _from, state) do
+    case Map.fetch(state.indices, model_version) do
+      {:ok, index} ->
+        # HNSWLib expects %Nx.Tensor{}
+        item_id = :erlang.phash2(node_id)
+        case HNSWLib.Index.add_items(index, embedding, ids: [item_id]) do
+          :ok ->
+            new_count = Map.get(state.insertion_count, model_version, 0) + 1
+            new_dirty_models = MapSet.put(state.dirty_models, model_version)
+
+            if new_count >= @persist_threshold, do: send(self(), :periodic_persist)
+
+            {:reply, :ok, %{state |
+              insertion_count: Map.put(state.insertion_count, model_version, new_count),
+              dirty_models: new_dirty_models
+            }}
+          error ->
+            {:reply, error, state}
+        end
+
+      :error ->
+        Logger.warning("VectorRouter: Attempt to add node with unsupported model: #{model_version}")
+        {:reply, {:error, :unsupported_model_version}, state}
+    end
+  end
+
+  @impl true
+  # --- LOGIC & ERROR HANDLING REFACTOR: handle_call({:query, ...}) now uses the correct index ---
+  def handle_call({:query, query_vector, model_version, opts}, _from, state) do
+    case Map.fetch(state.indices, model_version) do
+      {:ok, index} ->
+        k = Keyword.get(opts, :k, 10)
+        threshold = Keyword.get(opts, :threshold, 0.0)
+
+        case HNSWLib.Index.knn_query(index, query_vector, k: k) do
+          {:ok, labels, distances} ->
+            results =
+              Enum.zip(labels, distances)
+              |> Enum.filter(fn {_label, score} -> score >= threshold end)
+            {:reply, {:ok, results}, state}
+
+          {:error, msg} ->
+            # Catch empty index error from the C++ library
+            if is_binary(msg) and String.contains?(msg, "too small") do
+              {:reply, {:ok, []}, state}
+            else
+              Logger.error("HNSW Query Failed for model #{model_version}: #{msg}")
+              {:reply, {:error, msg}, state}
+            end
+
+          error ->
+            {:reply, error, state}
+        end
+
+      :error ->
+        # --- ERROR HANDLING: Return {:ok, []} on unsupported/missing model ---
+        Logger.warning("Query received for unsupported/missing model: #{model_version}. Returning empty results.")
+        {:reply, {:ok, []}, state}
+    end
+  end
+
+  @impl true
+  def handle_call(:persist, _from, state) do
+    Enum.each(state.indices, fn {model, index} -> save_to_disk(model, index) end)
+    {:reply, :ok, %{state | dirty_models: MapSet.new(), insertion_count: Map.new()}}
+  end
+
+  @impl true
+  def handle_info(:periodic_persist, state) do
+    # Only persist models that have changes
+    Enum.each(MapSet.to_list(state.dirty_models), fn model ->
+      if index = Map.get(state.indices, model) do
+        save_to_disk(model, index)
+      end
+    end)
+    {:noreply, %{state | dirty_models: MapSet.new(), insertion_count: Map.new()}}
+  end
+
+  defp load_index(model_version) do
+    path = index_file_path(model_version)
+    if File.exists?(path) do
+      HNSWLib.Index.load_index(:cosine, @dim, path)
+    else
+      {:error, :not_found}
+    end
+  end
+
+  defp save_to_disk(model_version, index) do
+    path = index_file_path(model_version)
+    Logger.debug("Persisting HNSW index for model '#{model_version}' to #{path}...")
+    HNSWLib.Index.save_index(index, path)
+  end
+end
+
+
+------------------------------------------------------------
+File: epoch_manager.ex
+------------------------------------------------------------
+defmodule CMS.EpochManager do
+  use GenServer
+  require Logger
+
+  @moduledoc """
+  Manages the lifecycle of Epoch Log files and the Mnesia index.
+
+  Responsibilities:
+  1. Creates new Epoch Log files (rotation).
+  2. Updates Mnesia with metadata (start_time, end_time, path).
+  3. Ensures proper closure of old logs.
+  """
+
+  # Mnesia Table Definition
+  @table_name :epoch_log_index
+
+  @log_dir "priv/data/epochs"
+  @rotation_interval :timer.hours(1)
+  @max_size_bytes 100 * 1024 * 1024 # 100MB
+
+  defstruct [:current_file_path, :current_log_id, :file_handle, :bytes_written, :rotation_timer]
+
+  # API
+
+  def start_link(_opts) do
+    GenServer.start_link(__MODULE__, :ok, name: __MODULE__)
+  end
+
+  def get_active_handle do
+    GenServer.call(__MODULE__, :get_active_handle)
+  end
+
+  def notify_bytes_written(count) do
+    GenServer.cast(__MODULE__, {:bytes_written, count})
+  end
+
+  def rotate_log do
+    GenServer.call(__MODULE__, :rotate)
+  end
+
+  # Callbacks
+
+  @impl true
+  def init(:ok) do
+    # Initialize Mnesia Schema and Directory
+    init_mnesia()
+    File.mkdir_p!(@log_dir)
+
+    # Open first log
+    state = start_new_epoch()
+
+    # Schedule time-based rotation
+    timer = Process.send_after(self(), :time_rotate, @rotation_interval)
+
+    {:ok, %{state | rotation_timer: timer}}
+  end
+
+  @impl true
+  def handle_call(:get_active_handle, _from, state) do
+    {:reply, state.file_handle, state}
+  end
+
+  @impl true
+  def handle_call(:rotate, _from, state) do
+    new_state = rotate_epoch(state)
+    {:reply, :ok, new_state}
+  end
+
+  @impl true
+  def handle_cast({:bytes_written, count}, state) do
+    new_bytes = state.bytes_written + count
+    if new_bytes >= @max_size_bytes do
+      Logger.info("EpochManager: Max size reached. Rotating log.")
+      {:noreply, rotate_epoch(state)}
+    else
+      {:noreply, %{state | bytes_written: new_bytes}}
+    end
+  end
+
+  @impl true
+  def handle_info(:time_rotate, state) do
+    Logger.info("EpochManager: Time interval reached. Rotating log.")
+    new_state = rotate_epoch(state)
+    timer = Process.send_after(self(), :time_rotate, @rotation_interval)
+    {:noreply, %{new_state | rotation_timer: timer}}
+  end
+
+  # Internals
+
+  defp init_mnesia do
+    # 1. Get Directory from Config
+    raw_dir = Application.get_env(:mnesia, :dir) || "priv/data/mnesia_store"
+
+    # FIX: Convert binary string to charlist for Erlang Mnesia compatibility.
+    # config.exs usually supplies a binary string, which causes :function_clause errors in Mnesia.
+    mnesia_dir = if is_binary(raw_dir), do: String.to_charlist(raw_dir), else: raw_dir
+
+    # 2. Ensure the directory exists on disk (using binary path for Elixir File module)
+    File.mkdir_p!(to_string(mnesia_dir))
+
+    # 3. Update Application Env to force Mnesia to use this Charlist path
+    Application.put_env(:mnesia, :dir, mnesia_dir)
+
+    nodes = [Node.self()]
+
+    # 4. Stop Mnesia to perform schema operations
+    :mnesia.stop()
+
+    # 5. Create Schema
+    case :mnesia.create_schema(nodes) do
+      :ok ->
+        Logger.info("Mnesia schema created on disk at #{mnesia_dir}.")
+      {:error, {_, {:already_exists, _}}} ->
+        Logger.info("Mnesia schema already exists.")
+      error ->
+        Logger.error("Mnesia create_schema failed: #{inspect(error)}")
+    end
+
+    # 6. Start Mnesia
+    :mnesia.start()
+
+    # 7. Create the Table
+    case :mnesia.create_table(@table_name, [
+      attributes: [:id, :start_time, :end_time, :file_path],
+      disc_copies: nodes
+    ]) do
+      {:atomic, :ok} -> Logger.info("Mnesia table #{@table_name} created.")
+      {:aborted, {:already_exists, _}} -> :ok
+      other -> Logger.error("Mnesia create_table failed: #{inspect(other)}")
+    end
+  end
+
+  defp start_new_epoch do
+    id = UUID.uuid4()
+    timestamp = DateTime.utc_now()
+    filename = "epoch_#{DateTime.to_iso8601(timestamp) |> String.replace(":", "-")}_#{id}.jsonl"
+    path = Path.join(@log_dir, filename)
+
+    {:ok, handle} = File.open(path, [:append, :utf8])
+
+    :mnesia.transaction(fn ->
+      :mnesia.write({@table_name, id, timestamp, :infinity, path})
+    end)
+
+    Logger.info("Started new Epoch Log: #{path}")
+
+    %__MODULE__{
+      current_file_path: path,
+      current_log_id: id,
+      file_handle: handle,
+      bytes_written: 0
+    }
+  end
+
+  defp rotate_epoch(state) do
+    File.close(state.file_handle)
+
+    now = DateTime.utc_now()
+    old_id = state.current_log_id
+
+    :mnesia.transaction(fn ->
+      [{_tag, _id, start, _end, path}] = :mnesia.read(@table_name, old_id)
+      :mnesia.write({@table_name, old_id, start, now, path})
+    end)
+
+    start_new_epoch()
+  end
+end
+
+
+------------------------------------------------------------
+File: log_appender.ex
+------------------------------------------------------------
+defmodule CMS.LogAppender do
+  use GenServer
+  require Logger
+
+  @moduledoc """
+  High-throughput append-only logger for the CMS.
+
+  Receives:
+  1. Node Snapshots (Create/Update) - CRITICAL: Stores full state for Chrono Stack.
+  2. Hebbian Updates (Link weights)
+  3. System/Failure Events (Query failures, etc.)
+
+  Writes to the active file handle provided by EpochManager.
+  """
+
+  @buffer_size 50 # Flush after 50 items
+  @flush_interval 1000 # Or every 1 second
+
+  def start_link(_opts) do
+    GenServer.start_link(__MODULE__, :ok, name: __MODULE__)
+  end
+
+  # Client API
+
+  @doc """
+  Logs a full Node snapshot.
+  Type: :node_created | :node_updated | :node_decayed
+
+  CRITICAL PATCH: Now accepts the *full* CMS.Node.t() for all updates,
+  ensuring the log is a full Chrono Stack history.
+  """
+  @spec append_node_event(CMS.Node.id(), atom(), CMS.Node.t() | map()) :: :ok
+  def append_node_event(node_id, type, %CMS.Node{} = full_node) when type in [:node_created, :node_updated, :node_migrated] do
+    GenServer.cast(__MODULE__, {:log, %{
+      timestamp: DateTime.utc_now(),
+      entity: :node,
+      id: node_id,
+      type: type,
+      # Store the *entire node struct* for full Chrono Stack auditability (Plan Sec 9)
+      data: full_node
+    }})
+  end
+
+  # Special case for node_decayed, which is a state change but doesn't require the full struct to be logged.
+  def append_node_event(node_id, type, data) when type in [:node_decayed] and is_map(data) do
+    GenServer.cast(__MODULE__, {:log, %{
+      timestamp: DateTime.utc_now(),
+      entity: :node,
+      id: node_id,
+      type: type,
+      data: data
+    }})
+  end
+
+  @doc """
+  Logs a batch of Hebbian weight updates.
+  """
+  def append_hebbian_updates(updates) do
+    GenServer.cast(__MODULE__, {:log, %{
+      timestamp: DateTime.utc_now(),
+      entity: :hebbian,
+      data: updates
+    }})
+  end
+
+  # --- NEW: System Event/Failure Reporting API ---
+  @doc """
+  Logs a critical system event, such as a query failure or system congestion.
+  """
+  @spec append_system_event(atom(), map()) :: :ok
+  def append_system_event(type, data) do
+    GenServer.cast(__MODULE__, {:log, %{
+      timestamp: DateTime.utc_now(),
+      entity: :system,
+      type: type,
+      data: data
+    }})
+  end
+
+  # Server Callbacks
+  # ... (init, handle_cast, handle_info, flush_buffer remain unchanged)
+
+  @impl true
+  def init(:ok) do
+    Process.send_after(self(), :flush, @flush_interval)
+    {:ok, %{buffer: []}}
+  end
+
+  @impl true
+  def handle_cast({:log, entry}, state) do
+    new_buffer = [entry | state.buffer]
+    if length(new_buffer) >= @buffer_size do
+      flush_buffer(new_buffer)
+      {:noreply, %{buffer: []}}
+    else
+      {:noreply, %{buffer: new_buffer}}
+    end
+  end
+
+  @impl true
+  def handle_info(:flush, state) do
+    unless Enum.empty?(state.buffer) do
+      flush_buffer(state.buffer)
+    end
+    Process.send_after(self(), :flush, @flush_interval)
+    {:noreply, %{buffer: []}}
+  end
+
+  defp flush_buffer(buffer) do
+    # Get handle from EpochManager (Step 7.1)
+    file = CMS.EpochManager.get_active_handle()
+
+    # 1. Reverse buffer (since we prepended)
+    # 2. Serialize to JSONL
+    data_chunk =
+      buffer
+      |> Enum.reverse()
+      |> Enum.map(&Jason.encode!/1)
+      |> Enum.join("\n")
+
+    # 3. Write newline at end
+    blob = data_chunk <> "\n"
+
+    case IO.write(file, blob) do
+      :ok ->
+        CMS.EpochManager.notify_bytes_written(byte_size(blob))
+      {:error, reason} ->
+        Logger.error("LogAppender failed to write to epoch log: #{inspect(reason)}")
+        # In prod, we might buffer back or crash to ensure no data loss
+    end
+  end
+end
+
+
+------------------------------------------------------------
+File: temporal_query_engine.ex
+------------------------------------------------------------
+defmodule CMS.TemporalQueryEngine do
+  @moduledoc """
+  Provides querying capabilities for the immutable history of the CMS.
+
+  Implements Gap 3: Chrono-Stack & Temporal Queries.
+  It queries the Mnesia index to find relevant Epoch Logs, then streams those logs
+  to reconstruct the state of a node at a specific timestamp.
+
+  CRITICAL PATCH: Uses deep merging to correctly apply partial node updates.
+  """
+
+  require Logger
+  @table_name :epoch_log_index
+
+  @doc """
+  Retrieves the full state of a Node as it existed at `target_time`.
+  """
+  @spec get_node_state_at_time(String.t(), DateTime.t()) :: {:ok, map()} | {:error, any()} # Returns map as full struct conversion is complex
+  def get_node_state_at_time(node_id, target_time) do
+    # 1. Find relevant epoch files from Mnesia
+    files = find_epoch_files_before(target_time)
+
+    if Enum.empty?(files) do
+      {:error, :no_history_found}
+    else
+      # 2. Reconstruct State
+      reconstruct_node(node_id, files, target_time)
+    end
+  end
+
+  defp find_epoch_files_before(target_time) do
+    matcher = :mnesia.transaction(fn ->
+      # FIX: Prefixed unused 'id' with underscore
+      :mnesia.foldl(fn {_tag, _id, start, _end, path}, acc ->
+        if DateTime.compare(start, target_time) != :gt do
+          [{start, path} | acc]
+        else
+          acc
+        end
+      end, [], @table_name)
+    end)
+
+    case matcher do
+      {:atomic, result} ->
+        # Sort by start_time ascending
+        result
+        |> Enum.sort_by(fn {start, _} -> start end, DateTime)
+        |> Enum.map(fn {_, path} -> path end)
+      _ -> []
+    end
+  end
+
+  defp reconstruct_node(node_id, file_paths, target_time) do
+    # Initialize accumulator to nil (meaning node not found yet)
+    initial_state = nil
+
+    # Reduce through files (oldest -> newest)
+    final_state = Enum.reduce(file_paths, initial_state, fn path, acc_node ->
+      if File.exists?(path) do
+        File.stream!(path)
+        |> Stream.map(&Jason.decode!/1)
+        |> Enum.reduce(acc_node, fn entry, curr_node ->
+          # Check if this log entry is relevant to our node and time
+          if entry["entity"] == "node" and entry["id"] == node_id and Map.has_key?(entry, "data") do
+            entry_ts = parse_ts(entry["timestamp"])
+
+            if DateTime.compare(entry_ts, target_time) != :gt do
+              apply_event(curr_node, entry)
+            else
+              curr_node # Skip events after target_time
+            end
+          else
+            curr_node # Skip non-node or non-matching ID entries
+          end
+        end)
+      else
+        acc_node # Skip file if not found
+      end
+    end)
+
+    if final_state do
+      Logger.debug("TemporalQueryEngine reconstructed state for #{node_id} at #{DateTime.to_iso8601(target_time)}.")
+      {:ok, final_state}
+    else
+      {:error, :node_not_found_at_timestamp}
+    end
+  end
+
+  defp parse_ts(iso_string) do
+    case DateTime.from_iso8601(iso_string) do
+      {:ok, dt, _} -> dt
+      _ -> raise "Invalid timestamp format in epoch log: #{iso_string}"
+    end
+  end
+
+  # --- New Function: Recursive Deep Map Merge ---
+  # FIX: Removed @doc attribute for private function
+  defp deep_merge_recursive(v1, v2) when is_map(v1) and is_map(v2) do
+    Map.merge(v1, v2, fn _key, val1, val2 -> deep_merge_recursive(val1, val2) end)
+  end
+  defp deep_merge_recursive(_v1, v2), do: v2
+  # ----------------------------------------------
+
+
+  # Event Application Logic (The "Replay")
+
+  # If it's a creation event, the data is the full node map.
+  defp apply_event(_curr, %{"type" => "node_created", "data" => data}), do: data
+
+  # --- LOGIC REFACTOR: Use deep merge for updates/migrations ---
+  # If it's an update event, the data is either a delta or a full snapshot.
+  # We use deep merge to correctly integrate the data, maintaining fields not present in 'data'.
+  defp apply_event(curr, %{"type" => type, "data" => data}) when type in ["node_updated", "node_migrated"] do
+    if curr != nil do
+      # Deep merge the current state with the incoming update/delta map
+      deep_merge_recursive(curr, data)
+    else
+      Logger.warning("TemporalQueryEngine encountered a #{type} event for non-existent node. Ignoring.")
+      curr
+    end
+  end
+
+  # Ignore other events (like hebbian updates which modify state *during* runtime)
+  defp apply_event(curr, _), do: curr
+end
+
+
+================================================================================
+Folder: cms/infrastructure/communication
+================================================================================
+
+------------------------------------------------------------
+File: bus_pipeline.ex
+------------------------------------------------------------
+defmodule CMS.BusPipeline do
+  use Broadway
+  require Logger
+
+  @moduledoc """
+  The Back-Pressure Pipeline for the Cognitive Bus.
+
+  Implements Gap 8.
+  Consumes events from CMS.QueryRouter and broadcasts them to
+  Semantic Regions via Phoenix.PubSub.
+  """
+
+  def start_link(_opts) do
+    Broadway.start_link(__MODULE__,
+      name: __MODULE__,
+      producer: [
+        module: {CMS.QueryRouter, []},
+        concurrency: 1
+      ],
+      processors: [
+        default: [
+          concurrency: 50, # Max 50 concurrent broadcasts allowed
+          max_demand: 10   # Prefetch 10 items per processor
+        ]
+      ],
+      batchers: [
+        default: [
+          batch_size: 10,
+          batch_timeout: 50
+        ]
+      ]
+    )
+  end
+
+  @impl true
+  def handle_message(_processor, message, _context) do
+    {query_context, target_regions} = message.data
+
+    # FIX: Utilize the variables for observability instead of ignoring them
+    Logger.metadata(
+      query_id: query_context[:query_id],
+      target_region_count: length(target_regions)
+    )
+
+    Broadway.Message.put_batcher(message, :default)
+  end
+
+  @impl true
+  def handle_batch(:default, messages, _batch_info, _context) do
+    # Execute the broadcasts
+    Enum.each(messages, fn message ->
+      {query_context, target_regions} = message.data
+      do_broadcast(query_context, target_regions)
+    end)
+
+    # Clean up metadata
+    Logger.metadata(query_id: nil, target_region_count: nil)
+
+    messages
+  end
+
+  defp do_broadcast(query_context, target_regions) do
+    # Broadcast to each target semantic region
+    Enum.each(target_regions, fn region_id ->
+      topic = "region:#{region_id}"
+
+      # The payload is the query context
+      # NodeActors subscribed to this topic will wake up
+      Phoenix.PubSub.broadcast(
+        CMS.PubSub,
+        topic,
+        {:query, query_context}
+      )
+    end)
+  end
+end
+
+
+------------------------------------------------------------
+File: query_router.ex
+------------------------------------------------------------
+defmodule CMS.QueryRouter do
+  use GenStage
+  require Logger
+
+  @moduledoc """
+  The entry point for the Cognitive Bus.
+
+  Acts as a GenStage Producer. It accepts queries and buffers them until
+  the Broadway pipeline (Consumers) requests them via back-pressure.
+  """
+
+  # API
+
+  @doc """
+  Submits a query to the Cognitive Bus.
+  """
+  @spec broadcast_query(map(), [integer()]) :: :ok | {:error, atom()}
+  def broadcast_query(query_context, target_regions) do
+    # FIX: Dynamically find the producer PID associated with the Broadway pipeline
+    # We cannot cast to __MODULE__ because Broadway spawns specifically named stages.
+    case Broadway.producer_names(CMS.BusPipeline) do
+      [producer_pid | _] ->
+        GenStage.cast(producer_pid, {:broadcast, query_context, target_regions})
+      [] ->
+        Logger.error("CMS.QueryRouter: No active producer found for BusPipeline.")
+        {:error, :bus_not_ready}
+    end
+  end
+
+  # Callbacks
+
+  @impl true
+  def init(_opts) do
+    # FIX: Changed argument from :ok to _opts to accept Broadway configuration
+    # buffer_size: limit the queue to prevent OOM on massive overload
+    {:producer, {:queue.new(), 0}, buffer_size: 10_000}
+  end
+
+  @impl true
+  def handle_cast({:broadcast, context, regions}, {queue, demand}) do
+    event = {context, regions}
+    dispatch_events(:queue.in(event, queue), demand, [])
+  end
+
+  @impl true
+  def handle_demand(incoming_demand, {queue, pending_demand}) do
+    dispatch_events(queue, incoming_demand + pending_demand, [])
+  end
+
+  # Dispatch Logic
+  defp dispatch_events(queue, 0, events) do
+    # No demand left, emit what we have and keep the rest
+    {:noreply, Enum.reverse(events), {queue, 0}}
+  end
+
+  defp dispatch_events(queue, demand, events) do
+    case :queue.out(queue) do
+      {{:value, event}, new_queue} ->
+        dispatch_events(new_queue, demand - 1, [event | events])
+      {:empty, _} ->
+        # Queue is empty, wait for more casts
+        {:noreply, Enum.reverse(events), {queue, demand}}
+    end
+  end
+end
+
+
+================================================================================
+Folder: cms/core
+================================================================================
+
+================================================================================
+Folder: cms/core/logic
+================================================================================
+
+------------------------------------------------------------
+File: salience_engine.ex
+------------------------------------------------------------
+defmodule CMS.SalienceEngine do
+  @moduledoc """
+  Calculates the intrinsic importance (Salience) of a new Memory Node.
+
+  Implements Section 2.4.3: The Weighting Engine.
+  High Salience -> High Antenna Gain -> Wider Broadcast.
+
+  FIX 5 IMPLEMENTED: ML Bridge with Heuristic Fallback.
+  """
+
+  require Logger
+
+  # Configuration for the local Python Bridge (e.g., LLM or BERT-based classifier)
+  @bridge_url "http://localhost:5000/api/v1/salience"
+  @default_timeout 2_000 # 2 seconds - Fail fast to keep ingestion speed high
+
+  # Keywords that imply high criticality (Fallback Logic)
+  @critical_keywords ~w(error crash panic critical security breach alert fail exception timeout deadlock)
+  @warning_keywords ~w(warning retry slow deprecated latency)
+
+  @doc """
+  Calculates a score (0.0 to 1.0) based on content analysis and context.
+  It attempts to use the ML Bridge first; otherwise, it falls back to heuristics.
+  """
+  @spec calculate(String.t(), map()) :: float()
+  def calculate(fact_text, provenance_metadata) do
+    # 1. Attempt External Semantic Analysis (Fix 5)
+    case call_ml_bridge(fact_text, provenance_metadata) do
+      {:ok, score} ->
+        score
+
+      {:error, _reason} ->
+        # 2. Fallback to Heuristic Analysis
+        calculate_heuristic(fact_text, provenance_metadata)
+    end
+  end
+
+  # --- Internal: ML Bridge ---
+
+  defp call_ml_bridge(text, metadata) do
+    payload = %{
+      text: text,
+      provenance: metadata
+    }
+
+    try do
+      # Requires 'req' library, similar to Tool.Embedder
+      case Req.post(@bridge_url, json: payload, receive_timeout: @default_timeout) do
+        {:ok, %Req.Response{status: 200, body: %{"score" => score}}} when is_number(score) ->
+          # Clamp score between 0.0 and 1.0 just in case
+          safe_score = max(0.0, min(1.0, score))
+          {:ok, safe_score}
+
+        {:ok, %Req.Response{status: code}} ->
+          Logger.warning("Salience Bridge returned non-200 status: #{code}. Switching to heuristic.")
+          {:error, :bridge_error}
+
+        {:error, exception} ->
+          Logger.warning("Salience Bridge connection failed: #{inspect(exception)}. Switching to heuristic.")
+          {:error, :connection_failed}
+      end
+    rescue
+      e ->
+        Logger.error("Salience Bridge crashed: #{inspect(e)}")
+        {:error, :crash}
+    end
+  end
+
+  # --- Internal: Heuristic Fallback ---
+
+  defp calculate_heuristic(fact_text, provenance_metadata) do
+    base_score = 0.5 # Neutral baseline
+
+    # 1. Contextual Boost (from Provenance)
+    # If the agent explicitly flags this as high priority
+    context_score = case Map.get(provenance_metadata, "priority", "normal") do
+      "critical" -> 1.0
+      "high" -> 0.8
+      "low" -> 0.2
+      _ -> 0.0
+    end
+
+    # 2. Content Analysis
+    text = String.downcase(fact_text)
+
+    content_score = cond do
+      contains_any?(text, @critical_keywords) -> 0.9
+      contains_any?(text, @warning_keywords) -> 0.7
+      true -> 0.0
+    end
+
+    # 3. Maximize
+    # If it's explicitly critical OR implicitly critical, we take the max
+    max(base_score, max(context_score, content_score))
+  end
+
+  defp contains_any?(text, keywords) do
+    Enum.any?(keywords, fn k -> String.contains?(text, k) end)
+  end
+end
+
+
+------------------------------------------------------------
+File: semantic_region.ex
+------------------------------------------------------------
+defmodule CMS.SemanticRegion do
+  @moduledoc """
+  Manages Semantic Partitioning logic.
+
+  Nodes are assigned to one of 256 regions based on their semantic embedding.
+  """
+
+  @num_regions 256
+
+  @doc """
+  Computes the region ID (0-255) for a given embedding and model version.
+  """
+  @spec compute_region_hash(Nx.Tensor.t(), String.t()) :: integer()
+  def compute_region_hash(embedding, model_version) do
+    # 1. Flatten embedding to list
+    data = Nx.to_flat_list(embedding)
+
+    # 2. Create deterministic seed string
+    seed = "#{model_version}:" <> Enum.join(data, ",")
+
+    # 3. Hash and map to region space
+    # FIX: Explicitly use @num_regions
+    :crypto.hash(:sha256, seed)
+    |> :binary.decode_unsigned()
+    |> rem(@num_regions)
+  end
+
+  @doc """
+  Subscribes the current process to the relevant region topics.
+  """
+  def subscribe(region_id, node_id) do
+    Phoenix.PubSub.subscribe(CMS.PubSub, "region:#{region_id}")
+    Phoenix.PubSub.subscribe(CMS.PubSub, "node_pulse:#{node_id}")
+    Phoenix.PubSub.subscribe(CMS.PubSub, "global:signals")
+  end
+
+  @doc """
+  Unsubscribes from a region topic (used during Node Migration).
+  """
+  def unsubscribe(region_id, _node_id) do
+    Phoenix.PubSub.unsubscribe(CMS.PubSub, "region:#{region_id}")
+  end
+end
+
+
+------------------------------------------------------------
+File: fid_validator.ex
+------------------------------------------------------------
+defmodule CMS.FIDValidator do
+  @moduledoc """
+  Validates the structural integrity of DataBodyPayloads during Ingestion.
+  """
+
+  alias CMS.DataBodyPayload.{Text, Code, Number, Link, Object}
+
+  @spec validate(CMS.DataBodyPayload.t()) :: :ok | {:error, String.t()}
+
+  def validate(%Text{content: c}) when is_binary(c) and byte_size(c) > 0, do: :ok
+  def validate(%Text{}), do: {:error, "FID: Text content must be a non-empty string"}
+
+  def validate(%Code{language: l, content: c}) when is_atom(l) and is_binary(c), do: :ok
+  def validate(%Code{}), do: {:error, "FID: Code must have an atom language and string content"}
+
+  def validate(%Number{value: v}) when is_number(v), do: :ok
+  def validate(%Number{}), do: {:error, "FID: Number value must be integer or float"}
+
+  def validate(%Link{uri: u}) when is_binary(u) do
+    if Regex.match?(~r/^(http|https|gm|ipfs):\/\//, u) do
+      :ok
+    else
+      {:error, "FID: Link URI must start with http, https, gm, or ipfs"}
+    end
+  end
+  def validate(%Link{}), do: {:error, "FID: Link URI missing"}
+
+  def validate(%Object{data: d}) when is_map(d), do: :ok
+  def validate(%Object{}), do: {:error, "FID: Object data must be a map"}
+
+  def validate(unknown), do: {:error, "Unknown struct type: #{inspect(unknown)}"}
+end
+
+
+------------------------------------------------------------
+File: fid_parser.ex
+------------------------------------------------------------
+defmodule CMS.FIDParser do
+  @moduledoc """
+  Provides functions for consuming Agents to parse and interpret
+  CMS.DataBodyPayloads based on their Format ID (FID) type.
+
+  Implements Gap 12: Polymorphic Consumption Logic.
+  """
+
+  alias CMS.DataBodyPayload.{Text, Code, Number, Link, Object}
+
+  @doc """
+  Parses a list of DataBodyPayloads, returning a list of raw usable content.
+  """
+  @spec parse_all([CMS.DataBodyPayload.t()]) :: list(any())
+  def parse_all(payloads) when is_list(payloads) do
+    Enum.map(payloads, &parse/1)
+  end
+
+  @doc """
+  Parses a single DataBodyPayload into a usable primitive for an Agent.
+  """
+  @spec parse(CMS.DataBodyPayload.t()) :: any() | {:error, String.t()}
+
+  # FID: Text -> Returns simple string
+  def parse(%Text{content: content}), do: content
+
+  # FID: Code -> Returns tuple {language, content} for the Specialist Agent to compile
+  def parse(%Code{language: lang, content: content}), do: {lang, content}
+
+  # FID: Number -> Returns {value, unit} for the Validator Agent (Regression Testing)
+  def parse(%Number{value: value, unit: unit}), do: {value, unit}
+
+  # FID: Link -> Returns URI. Agent must then query GM or External Web.
+  def parse(%Link{uri: uri}), do: uri
+
+  # FID: Object -> Returns the raw data map. Agent must interpret based on object_type.
+  def parse(%Object{data: data}), do: data
+
+  # Fallback for unknown/corrupt payloads
+  def parse(other) do
+    {:error, "Unknown or Malformed FID Payload: #{inspect(other)}"}
+  end
+end
+
+
+------------------------------------------------------------
+File: node_factory.ex
+------------------------------------------------------------
+defmodule CMS.NodeFactory do
+  @moduledoc """
+  Responsible for enforcing Content-Addressable Memory (CAM) principles.
+
+  The Node ID is derived from a SHA-256 hash of the canonical JSON representation
+  of the DataHead, DataBody, and Provenance Metadata. This ensures that
+  identical knowledge maps to the same address.
+  """
+
+  alias CMS.NodeBody
+
+  @doc """
+  Derives a content-addressable ID for a new CMS Node.
+
+  This ID is a hash of the NodeBody (Truth) and Provenance.
+  We specifically exclude dynamic fields (like DataTail.salience_score or Edges)
+  because the Identity of the node should not change just because it gained a new link.
+  """
+  @spec derive_content_addressable_id(NodeBody.t(), map()) :: String.t()
+  def derive_content_addressable_id(%NodeBody{} = body, provenance_metadata) do
+    # 1. Extract the "Truth" components.
+    # We strictly use DataHead and DataBody.
+    # DataTail is excluded from the ID hash because relationships (Edges) evolve
+    # (Neuroplasticity), but the Node's fundamental "Fact" remains constant.
+    truth_component = %{
+      data_head: body.data_head,
+      data_body: body.data_body
+    }
+
+    # 2. Canonical Serialization of Truth.
+    # sort_keys: true is CRITICAL. {a:1, b:2} must hash strictly equal to {b:2, a:1}.
+    canonical_truth_json = Jason.encode!(truth_component, sort_keys: true)
+
+    # 3. Canonical Serialization of Provenance.
+    # This ensures that if the same Fact comes from a different Source context,
+    # it *might* be treated as a distinct node (depending on ingestion logic),
+    # or merged. The ACN Whitepaper suggests Provenance is part of Identity.
+    canonical_provenance_json = Jason.encode!(provenance_metadata, sort_keys: true)
+
+    # 4. Concatenate and Hash.
+    content_stream = canonical_truth_json <> canonical_provenance_json
+
+    :crypto.hash(:sha256, content_stream)
+    |> Base.encode16(case: :lower)
+  end
+end
+
+
+================================================================================
+Folder: cms/core/structs
+================================================================================
+
+------------------------------------------------------------
+File: node_antenna.ex
+------------------------------------------------------------
+defmodule CMS.NodeAntenna do
+  @moduledoc """
+  Represents the 'Antenna' of a CMS Node: The Synaptic Transceiver.
+
+  Responsibilities:
+  1. Modulates signal strength (Gain) for Spreading Activation.
+  2. Tracks activation frequency for metabolic decay logic.
+  3. Applies Physical Urgency overrides (signal_modulations).
+  """
+
+  @derive {Jason.Encoder, only: [:gain, :activation_frequency, :signal_modulations]}
+  defstruct [
+    :gain,                 # Float (0.0 - 2.0): Signal amplification factor
+    :activation_frequency, # Float: Historical metric
+    :signal_modulations    # Map: Real-time overrides
+  ]
+
+  @type t :: %__MODULE__{
+    gain: float(),
+    activation_frequency: float(),
+    signal_modulations: map()
+  }
+
+  @doc """
+  Calculates the initial antenna gain based on the node's Salience Score.
+  """
+  @spec calculate_gain(float()) :: float()
+  def calculate_gain(salience_score) when salience_score >= 0.0 and salience_score <= 1.0 do
+    salience_score * 2.0
+  end
+
+  @doc """
+  Factory method for a new Antenna.
+  """
+  @spec new(float()) :: t()
+  def new(initial_salience) do
+    %__MODULE__{
+      gain: calculate_gain(initial_salience),
+      activation_frequency: 0.0,
+      signal_modulations: %{}
+    }
+  end
+end
+
+
+------------------------------------------------------------
+File: data_body_payload.ex
+------------------------------------------------------------
+defmodule CMS.DataBodyPayload do
+  @moduledoc """
+  Defines the polymorphic structure for elements within a CMS.NodeBody.data_body.
+
+  This implements the 'Format ID' (FID) system (Section 2.2.2), ensuring consuming
+  Agents can deterministically parse content (e.g., distinguishing executable code
+  from descriptive text).
+  """
+
+  # ----------------------------------------------------------------------------
+  # FID: TEXT
+  # ----------------------------------------------------------------------------
+  defmodule Text do
+    @derive {Jason.Encoder, only: [:type, :content]}
+    defstruct type: :text, content: ""
+    @type t :: %__MODULE__{type: :text, content: String.t()}
+  end
+
+  # ----------------------------------------------------------------------------
+  # FID: CODE
+  # ----------------------------------------------------------------------------
+  defmodule Code do
+    @derive {Jason.Encoder, only: [:type, :language, :content]}
+    defstruct type: :code, language: :elixir, content: ""
+    @type t :: %__MODULE__{type: :code, language: atom(), content: String.t()}
+  end
+
+  # ----------------------------------------------------------------------------
+  # FID: NUMBER
+  # ----------------------------------------------------------------------------
+  defmodule Number do
+    @derive {Jason.Encoder, only: [:type, :value, :unit]}
+    defstruct type: :number, value: 0.0, unit: nil
+    @type t :: %__MODULE__{type: :number, value: number(), unit: atom() | nil}
+  end
+
+  # ----------------------------------------------------------------------------
+  # FID: LINK (External/GM Resource)
+  # ----------------------------------------------------------------------------
+  defmodule Link do
+    @derive {Jason.Encoder, only: [:type, :uri, :description]}
+    defstruct type: :link, uri: "", description: nil
+    @type t :: %__MODULE__{type: :link, uri: String.t(), description: String.t() | nil}
+  end
+
+  # ----------------------------------------------------------------------------
+  # FID: OBJECT (Serialized Data)
+  # ----------------------------------------------------------------------------
+  defmodule Object do
+    @derive {Jason.Encoder, only: [:type, :object_type, :data]}
+    defstruct type: :object, object_type: nil, data: %{}
+    @type t :: %__MODULE__{type: :object, object_type: atom() | nil, data: map()}
+  end
+
+  # Union Type for Dialyzer
+  @type t :: Text.t() | Code.t() | Number.t() | Link.t() | Object.t()
+end
+
+
+------------------------------------------------------------
+File: node_body.ex
+------------------------------------------------------------
+defmodule CMS.NodeBody do
+  @moduledoc """
+  Represents the 'Body' of a CMS Node: The Tripartite Vessel of Truth.
+
+  Contains:
+  1. DataHead: The semantic anchor (Natural Language Fact).
+  2. DataBody: The structured payload (Polymorphic Evidence).
+  3. DataTail: The administrative ledger (Relationships & Provenance).
+  """
+
+  @derive {Jason.Encoder, only: [:data_head, :data_body, :data_tail]}
+  defstruct [
+    :data_head, # %CMS.DataHead{}
+    :data_body, # List of %CMS.DataBodyPayload{}
+    :data_tail  # %CMS.DataTail{}
+  ]
+
+  @type t :: %__MODULE__{
+    data_head: any(), # Type defined in next step
+    data_body: list(any()), # Type defined in next step
+    data_tail: any()  # Type defined in next step
+  }
+
+  @spec new(any(), list(any()), any()) :: t()
+  def new(head, body_payloads, tail) do
+    %__MODULE__{
+      data_head: head,
+      data_body: body_payloads,
+      data_tail: tail
+    }
+  end
+end
+
+
+------------------------------------------------------------
+File: json_extensions.ex
+------------------------------------------------------------
+defimpl Jason.Encoder, for: Nx.Tensor do
+  def encode(tensor, opts) do
+    # Convert the high-performance Tensor binary into a simple list of floats
+    # so it can be written to the JSON log file.
+    list_data = Nx.to_flat_list(tensor)
+    Jason.Encode.list(list_data, opts)
+  end
+end
+
+
+------------------------------------------------------------
+File: node.ex
+------------------------------------------------------------
+defmodule CMS.Node do
+  @moduledoc """
+  The foundational atom of the Associative Cognitive Memory System.
+  """
+
+  @derive {Jason.Encoder, only: [:id, :head, :body, :antenna, :created_at, :last_fired]}
+  defstruct [
+    :id, :head, :body, :antenna, :created_at, :last_fired
+  ]
+
+  @type id :: String.t()
+  @type t :: %__MODULE__{
+    id: id(),
+    head: CMS.NodeHead.t(),
+    body: CMS.NodeBody.t(),
+    antenna: CMS.NodeAntenna.t(),
+    created_at: DateTime.t(),
+    last_fired: DateTime.t()
+  }
+
+  @spec new(CMS.NodeHead.t(), CMS.NodeBody.t(), map()) :: {:ok, t()} | {:error, any()}
+  def new(head, body, provenance_metadata) do
+    # Gap 14: Derive ID from content.
+    node_id = CMS.NodeFactory.derive_content_addressable_id(body, provenance_metadata)
+
+    # Use the salience score directly to create the antenna
+    # (Removed unused initial_gain variable)
+    antenna = CMS.NodeAntenna.new(body.data_tail.salience_score)
+
+    {:ok, %__MODULE__{
+      id: node_id,
+      head: head,
+      body: body,
+      antenna: antenna,
+      created_at: DateTime.utc_now(),
+      last_fired: DateTime.utc_now()
+    }}
+  end
+end
+
+
+------------------------------------------------------------
+File: data_tail.ex
+------------------------------------------------------------
+defmodule CMS.DataTail do
+  @moduledoc """
+  Represents the 'Tail' of a CMS Node: The Administrative Ledger.
+
+  Responsibilities:
+  1. Topology: Holds the list of Edges (relationships).
+  2. Provenance: Tracks versioning pointers (Chrono Stack).
+  3. Security: Holds **Structured ACLs** (Access Control Lists).
+  4. Salience: Holds the base importance score (used to initialize Antenna Gain).
+
+  CRITICAL UPDATE (Gap 11/12): ACLs are now a structured map for role-based security.
+  """
+
+  alias CMS.Edge
+
+  @derive {Jason.Encoder, only: [:versioning_pointer, :checksum, :acls, :salience_score, :relationship_metadata]}
+  defstruct [
+    :versioning_pointer,    # String: URI/Ref to previous state (e.g., "gm://node/v1")
+    :checksum,              # String: SHA3-256 hash of {DataHead + DataBody}
+    :acls,                  # Map: %{read: [String.t()], write: [String.t()]}
+    :salience_score,        # Float 0.0 - 1.0: Intrinsic importance
+    :relationship_metadata  # List[%CMS.Edge{}]: The outgoing connections
+  ]
+
+  # --- TYPE REFACTOR: Updated ACLs to a map ---
+  @type acls_t :: %{
+    read: [String.t()],    # Agent IDs or Roles that can read the node (e.g., "public", "system")
+    write: [String.t()]   # Agent IDs or Roles that can modify the node
+  }
+
+  @type t :: %__MODULE__{
+    versioning_pointer: String.t() | nil,
+    checksum: String.t(),
+    acls: acls_t(),
+    salience_score: float(),
+    relationship_metadata: [CMS.Edge.t()]
+  }
+
+  # --- STRUCT UPDATE: New constructor uses structured default ACLs ---
+  @doc """
+  Creates a new DataTail struct.
+  """
+  @spec new(float(), [CMS.Edge.t()], acls_t() | [String.t()] | nil, String.t() | nil) :: t()
+  def new(salience_score, edges \\ [], acls_input \\ nil, versioning_pointer \\ nil) do
+    # Normalize the input ACLs. If a simple list is provided, default it to both read/write roles.
+    acls = case acls_input do
+      nil ->
+        %{read: ["public"], write: ["system", "root"]}
+      %{} = map ->
+        map
+      list when is_list(list) ->
+        # Assume if a list of IDs is provided, they have full control
+        %{read: list ++ ["public"], write: list}
+    end
+
+    %__MODULE__{
+      salience_score: salience_score,
+      relationship_metadata: edges,
+      acls: acls,
+      versioning_pointer: versioning_pointer,
+      checksum: "" # Checksum is calculated during NodeFactory creation (Step 5)
+    }
+  end
+end
+
+
+------------------------------------------------------------
+File: data_head.ex
+------------------------------------------------------------
+defmodule CMS.DataHead do
+  @moduledoc """
+  Represents the 'Fact' of a CMS Node.
+
+  This is the semantic anchor. It must be a single, declarative natural language sentence.
+  The Embedder uses this string to generate the vector representation in the NodeHead.
+  """
+
+  @derive {Jason.Encoder, only: [:fact]}
+  defstruct [
+    :fact # String: e.g., "The Mars Rover detected high levels of perchlorate."
+  ]
+
+  @type t :: %__MODULE__{
+    fact: String.t()
+  }
+
+  @spec new(String.t()) :: t()
+  def new(fact) when is_binary(fact) do
+    %__MODULE__{fact: fact}
+  end
+end
+
+
+------------------------------------------------------------
+File: edge.ex
+------------------------------------------------------------
+defmodule CMS.Edge do
+  @moduledoc """
+  Represents an associative or structural link between two CMS Nodes.
+
+  Crucial for defining the cognitive graph's topology.
+  Implements Gap B: Explicit Link Typing.
+  """
+
+  @derive {Jason.Encoder, only: [:target_node_id, :type, :weight, :last_used_at]}
+  defstruct [
+    :target_node_id, # String: UUID/Hash of the connected node
+    :type,           # Atom: :semantic, :syntactic, :dependency, :contradicts, :causes
+    :weight,         # Float 0.01 - 1.0: Hebbian strength.
+    :last_used_at    # DateTime: For DecayManager to calculate 'Active Forgetting'
+  ]
+
+  @type link_type :: :semantic | :syntactic | :dependency | :contradicts | :causes | :similar_to
+
+  @type t :: %__MODULE__{
+    target_node_id: String.t(),
+    type: link_type(),
+    weight: float(),
+    last_used_at: DateTime.t()
+  }
+
+  @doc """
+  Creates a new edge. Clamps weight between 0.01 and 1.0.
+  """
+  @spec new(String.t(), link_type(), float()) :: t()
+  def new(target_node_id, type, weight \\ 0.5) do
+    # Clamp weight to ensure system stability
+    safe_weight = max(0.01, min(1.0, weight))
+
+    %__MODULE__{
+      target_node_id: target_node_id,
+      type: type,
+      weight: safe_weight,
+      last_used_at: DateTime.utc_now()
+    }
+  end
+end
+
+
+------------------------------------------------------------
+File: node_head.ex
+------------------------------------------------------------
+defmodule CMS.NodeHead do
+  @moduledoc """
+  Represents the 'Head' of a CMS Node: The Local Cognitive Engine.
+
+  Responsibilities:
+  1. Holds the semantic vector embedding for similarity comparisons.
+  2. Manages the 'Metabolic State' (internal_state) which acts as a firing inhibitor.
+  3. Tracks the embedding model version to handle Model Drift (Gap 7).
+  """
+
+  @derive {Jason.Encoder, only: [:embedding, :embedding_model_version, :relevance_threshold, :internal_state]}
+  defstruct [
+    :embedding,               # Nx.Tensor: The semantic representation of DataHead.fact
+    :embedding_model_version, # String: e.g., "openai_ada_002_v1", "bert_quantized_v4"
+    :relevance_threshold,     # Float (0.0 - 1.0): The base confidence required to fire
+    :internal_state           # Atom: :high_energy, :low_energy, :hibernating, :recovering
+  ]
+
+  @type embedding :: Nx.Tensor.t()
+  @type model_version :: String.t()
+  @type internal_state :: :high_energy | :low_energy | :hibernating | :recovering
+
+  @type t :: %__MODULE__{
+    embedding: embedding(),
+    embedding_model_version: model_version(),
+    relevance_threshold: float(),
+    internal_state: internal_state()
+  }
+
+  @doc """
+  Creates a new NodeHead with default metabolic energy.
+  """
+  @spec new(Nx.Tensor.t(), String.t(), float()) :: t()
+  def new(embedding, model_version, threshold \\ 0.85) do
+    %__MODULE__{
+      embedding: embedding,
+      embedding_model_version: model_version,
+      relevance_threshold: threshold,
+      internal_state: :high_energy # New nodes start with high energy (Recent Creation Bias)
+    }
+  end
+end
+
+
+================================================================================
+Folder: cms/tools
+================================================================================
+
+------------------------------------------------------------
+File: embedder.ex
+------------------------------------------------------------
+defmodule CMS.Tool.Embedder do
+  @moduledoc """
+  Interface for generating vector embeddings via the Python ML Bridge.
+
+  Connects to the local FastAPI service (ml_bridge.py) to convert text
+  into dense vector representations for the CMS.VectorRouter.
+  """
+
+  require Logger
+
+  # Configuration for the local Python Bridge
+  @bridge_url "http://localhost:5000/api/v1/embed"
+  @default_timeout 10_000 # 10 seconds
+
+  @doc """
+  Generates a vector embedding for the given text using the ML Bridge.
+
+  Returns:
+    {:ok, Nx.Tensor.t()} - The vector as an Nx Tensor.
+    {:error, term()} - If the bridge is down or returns an error.
+  """
+  @spec generate(String.t(), String.t()) :: {:ok, Nx.Tensor.t()} | {:error, any()}
+  def generate(text, model_version) do
+    # Prepare the payload matching ml_bridge.py's EmbeddingRequest schema
+    payload = %{
+      text: text,
+      model_version: model_version
+    }
+
+    # Execute request
+    case Req.post(@bridge_url, json: payload, receive_timeout: @default_timeout) do
+      {:ok, %Req.Response{status: 200, body: body}} ->
+        process_response(body)
+
+      {:ok, %Req.Response{status: code, body: body}} ->
+        Logger.error("Embedder Bridge Error [#{code}]: #{inspect(body)}")
+        {:error, :bridge_error}
+
+      {:error, exception} ->
+        Logger.error("Embedder Connection Failed: #{inspect(exception)}")
+        {:error, :connection_failed}
+    end
+  end
+
+  # Internals
+
+  defp process_response(%{"vector" => vector_list}) when is_list(vector_list) do
+    # Convert the raw list of floats into an Nx Tensor
+    tensor = Nx.tensor(vector_list)
+    {:ok, tensor}
+  end
+
+  defp process_response(invalid_body) do
+    Logger.error("Embedder received invalid response format: #{inspect(invalid_body)}")
+    {:error, :invalid_response_format}
+  end
+end
+
