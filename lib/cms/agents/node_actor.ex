@@ -2,67 +2,95 @@ defmodule CMS.NodeActor do
   use GenServer
   require Logger
 
-  # FIX: Cleaned up aliases and ensured they are used
   alias CMS.{Node, ActivationEngine, QueryCoordinator, RegionalHebbianBuffer, LogAppender, SemanticRegion, TemporalQueryEngine}
-  alias CMS.Edge
   alias CMS.Security
   alias CMS.Tool.Embedder
 
   @moduledoc """
   The Atomic Unit of Cognition (The "Neuron").
 
-  Implements:
-  - Fix 2: State Hydration (Crash Amnesia Fix).
-  - Gap 11.4: Node Migration.
-  - Section 7.2: Hebbian & Anti-Hebbian Learning.
-  - Section 8.2: Model Drift Handling.
+  CRITICAL REMEDIATION (Fix 2 & Zombie Fix & Tuning):
+  1. Implements Defensive Coding: Replaces strict map access with Map.get/3.
+  2. Implements Safe Math: Guards Nx.dot operations.
+  3. ZOMBIE FIX: Guards against starting with nil ID or Head.
+  4. HYDRATION FIX: Ensures node terminates if it cannot find data.
+  5. TUNING: Implements Synaptic Damping to cure "ADHD/Hub Dominance".
   """
 
   @abnormality_topic "global:abnormality_signal"
 
-  defstruct [:node, :region_id, :hydrated?]
+  defstruct [:node, :region_id, :hydrated?, :hydration_retry_count]
 
+  # --- ZOMBIE FIX: Guard against starting invalid nodes ---
   def start_link(%Node{} = node) do
-    GenServer.start_link(__MODULE__, node, name: via_tuple(node.id))
+    if is_nil(node.id) do
+      Logger.error("NodeActor failed to start: Node ID is nil.")
+      {:error, :invalid_node_id}
+    else
+      GenServer.start_link(__MODULE__, node, name: via_tuple(node.id))
+    end
   end
 
   @impl true
   def init(node) do
-    # 1. Subscribe to Semantic Region
-    region_id = SemanticRegion.compute_region_hash(node.head.embedding, node.head.embedding_model_version)
-    SemanticRegion.subscribe(region_id, node.id)
+    # --- ZOMBIE FIX: Guard against missing head/embedding ---
+    if is_nil(node.head) or is_nil(node.head.embedding) do
+      Logger.error("NodeActor #{node.id} failed to init: Missing head or embedding.")
+      {:stop, :invalid_initial_state}
+    else
+      # 1. Subscribe to Semantic Region
+      region_id = SemanticRegion.compute_region_hash(node.head.embedding, node.head.embedding_model_version)
+      SemanticRegion.subscribe(region_id, node.id)
 
-    # 2. FIX 2: Schedule State Hydration
-    Process.send_after(self(), :hydrate, 10)
+      # 2. Schedule State Hydration
+      Process.send_after(self(), :hydrate, 10)
 
-    {:ok, %__MODULE__{node: node, region_id: region_id, hydrated?: false}}
-  end
-
-  # --- FIX 2: Hydration Logic ---
-  @impl true
-  def handle_info(:hydrate, state) do
-    Logger.debug("NodeActor #{state.node.id}: Attempting hydration from Temporal History...")
-
-    case TemporalQueryEngine.get_node_state_at_time(state.node.id, DateTime.utc_now()) do
-      {:ok, restored_node_map} ->
-        # Simplified merge logic assuming struct compatibility
-        restored_node = struct(CMS.Node, restored_node_map)
-
-        Logger.info("NodeActor #{state.node.id}: Hydrated successfully.")
-        {:noreply, %{state | node: restored_node, hydrated?: true}}
-
-      {:error, _reason} ->
-        Logger.debug("NodeActor #{state.node.id}: No history found. Starting fresh.")
-        {:noreply, %{state | hydrated?: true}}
+      {:ok, %__MODULE__{node: node, region_id: region_id, hydrated?: false, hydration_retry_count: 0}}
     end
   end
 
-  # --- Standard Bus Handlers ---
+  @impl true
+  # --- HYDRATION FIX: Strict checks to prevent empty "hydrated" state ---
+  def handle_info(:hydrate, state) do
+    case TemporalQueryEngine.get_node_state_at_time(state.node.id, DateTime.utc_now()) do
+      {:ok, restored_node_map} ->
+        try do
+          restored_node = struct(CMS.Node, restored_node_map)
+
+          if is_nil(restored_node.head) do
+             raise "Restored node has no head"
+          end
+
+          {:noreply, %{state | node: restored_node, hydrated?: true}}
+        rescue
+          e ->
+            Logger.error("NodeActor #{state.node.id}: Hydration struct conversion failed: #{inspect(e)}")
+            retry_hydration(state)
+        end
+
+      {:error, :node_not_found_at_timestamp} ->
+        if state.node.head do
+          Logger.debug("NodeActor #{state.node.id}: New node, using initial state.")
+          {:noreply, %{state | hydrated?: true}}
+        else
+          Logger.error("NodeActor #{state.node.id}: No history and invalid initial state. Terminating.")
+          {:stop, :zombie_node, state}
+        end
+
+      {:error, reason} ->
+        Logger.warning("NodeActor #{state.node.id}: Hydration failed with reason: #{inspect(reason)}")
+        retry_hydration(state)
+    end
+  end
+
+  # --- Standard Bus Handlers (handle_info) ---
 
   @impl true
   def handle_info({:query, context}, state) do
     if state.hydrated? do
-      if MapSet.member?(context.trace, state.node.id) do
+      trace = Map.get(context, :trace, MapSet.new())
+
+      if MapSet.member?(trace, state.node.id) do
         {:noreply, state}
       else
         process_activation(:primary, context, state, 0.0)
@@ -74,9 +102,12 @@ defmodule CMS.NodeActor do
 
   @impl true
   def handle_info({:pulse, payload}, state) do
-    %{query_context: context, ttl: ttl, trace: trace, boost_score: boost, origin_id: origin_id} = payload
+    context = Map.get(payload, :query_context, %{})
+    ttl = Map.get(payload, :ttl, 0)
+    trace = Map.get(payload, :trace, MapSet.new())
+    boost = Map.get(payload, :boost_score, 0.0)
+    origin_id = Map.get(payload, :origin_id)
 
-    # GAP 9 FIX: Handle :infinity atom explicitly
     is_dead_pulse = (is_integer(ttl) and ttl <= 0)
 
     if is_dead_pulse or MapSet.member?(trace, state.node.id) do
@@ -87,12 +118,16 @@ defmodule CMS.NodeActor do
     end
   end
 
-  # --- GenServer Calls ---
+  # --- GenServer Calls (handle_call) ---
 
   @impl true
   def handle_call(:get_drift_info, _from, state) do
-    result = {state.node.id, state.node.head.embedding, state.node.head.embedding_model_version, state.region_id}
-    {:reply, result, state}
+    if state.node.head do
+      result = {state.node.id, state.node.head.embedding, state.node.head.embedding_model_version, state.region_id}
+      {:reply, {:ok, result}, state}
+    else
+      {:reply, {:error, :invalid_state}, state}
+    end
   end
 
   @impl true
@@ -104,7 +139,7 @@ defmodule CMS.NodeActor do
   def handle_call(:get_decay_criteria, _from, state) do
     node = state.node
     total_link_weight = calculate_total_link_weight(node)
-    {:reply, {node.head.internal_state, total_link_weight}, state}
+    {:reply, {:ok, {node.head.internal_state, total_link_weight}}, state}
   end
 
   @impl true
@@ -113,13 +148,17 @@ defmodule CMS.NodeActor do
     {:reply, trust, state}
   end
 
-  # --- GenServer Casts (Expanded for Completeness) ---
+  @impl true
+  def handle_call(:get_state_snapshot, _from, state) do
+    {:reply, state.node, state}
+  end
+
+  # --- GenServer Casts (handle_cast) ---
 
   @impl true
   def handle_cast(:perform_differential_decay, state) do
     now = DateTime.utc_now()
 
-    # 1. Decay Edges
     new_edges = Enum.map(state.node.body.data_tail.relationship_metadata, fn edge ->
       hours_unused = DateTime.diff(now, edge.last_used_at, :hour)
       if hours_unused > 24 do
@@ -129,7 +168,6 @@ defmodule CMS.NodeActor do
       end
     end)
 
-    # 2. Update Metabolic State
     days_since_fired = DateTime.diff(now, state.node.last_fired, :day)
     frequency = state.node.antenna.activation_frequency
 
@@ -171,14 +209,11 @@ defmodule CMS.NodeActor do
     {:noreply, %{state | region_id: new_region}}
   end
 
-  # --- NEW: Anti-Hebbian Penalization (Gap C) ---
   @impl true
   def handle_cast({:feedback, :irrelevant, _context_id, penalization_amount}, state) do
-    # Penalize recent links. For simplicity, we reduce all active link weights.
     current_edges = state.node.body.data_tail.relationship_metadata
 
     updated_edges = Enum.map(current_edges, fn edge ->
-      # Reduce weight, clamping at 0.01
       new_weight = max(0.01, edge.weight - penalization_amount)
       %{edge | weight: new_weight}
     end)
@@ -190,37 +225,26 @@ defmodule CMS.NodeActor do
     {:noreply, %{state | node: new_node}}
   end
 
-  # --- NEW: Model Drift Repair (Gap 7) ---
   @impl true
   def handle_cast({:re_embed_request, active_model}, state) do
-    Logger.info("NodeActor #{state.node.id}: Re-embedding self to model #{active_model}...")
-
-    # 1. Generate new embedding
     case Embedder.generate(state.node.body.data_head.fact, active_model) do
       {:ok, new_embedding} ->
          new_head = %{state.node.head |
            embedding: new_embedding,
            embedding_model_version: active_model
          }
-
-         # 2. Trigger self-update via cast
          GenServer.cast(self(), {:update_node_head, new_head})
-
       {:error, reason} ->
          Logger.error("NodeActor #{state.node.id}: Re-embedding failed: #{inspect(reason)}")
     end
-
     {:noreply, state}
   end
 
   @impl true
   def handle_cast({:update_node_head, new_head}, state) do
     new_node = %{state.node | head: new_head}
-
-    # Recalculate region since embedding changed
     new_region = SemanticRegion.compute_region_hash(new_head.embedding, new_head.embedding_model_version)
 
-    # Update Subscription if region changed
     if new_region != state.region_id do
       SemanticRegion.unsubscribe(state.region_id, state.node.id)
       SemanticRegion.subscribe(new_region, state.node.id)
@@ -231,6 +255,20 @@ defmodule CMS.NodeActor do
   end
 
   # --- Internal Logic ---
+
+  defp retry_hydration(state) do
+    current_retry = state.hydration_retry_count
+    next_retry = current_retry + 1
+
+    if next_retry <= 5 do
+      delay = min(1000, 10 * :math.pow(2, next_retry) |> round)
+      Process.send_after(self(), :hydrate, delay)
+      {:noreply, %{state | hydration_retry_count: next_retry}}
+    else
+      Logger.error("NodeActor #{state.node.id}: Hydration failed after 5 attempts. Node will be terminated.")
+      {:stop, :hydration_failure, state}
+    end
+  end
 
   defp rules do
     [
@@ -265,11 +303,11 @@ defmodule CMS.NodeActor do
     check_for_abnormality(node, context, total)
 
     if total >= threshold do
-      # FIX: Restored Security Check using alias Security
-      if Security.can_read?(context.agent_id, node.body.data_tail.acls) do
+      agent_id = Map.get(context, :agent_id, "unknown")
+
+      if Security.can_read?(agent_id, node.body.data_tail.acls) do
         fire_node(type, total, context, state, ttl)
       else
-        Logger.debug("Node #{node.id} suppressed. Agent #{context.agent_id} denied by ACLs.")
         {:noreply, state}
       end
     else
@@ -280,7 +318,6 @@ defmodule CMS.NodeActor do
   defp check_for_abnormality(node, context, score) do
     Enum.each(rules(), fn {rule_name, check_fn} ->
       if check_fn.(node, context, score) do
-        Logger.error("Node #{node.id} triggered Abnormality Signal (Rule: #{rule_name}).")
         Phoenix.PubSub.broadcast(CMS.PubSub, @abnormality_topic, {
           :abnormality_signal,
           node_id: node.id,
@@ -293,22 +330,20 @@ defmodule CMS.NodeActor do
 
   defp fire_node(type, score, context, state, incoming_ttl) do
     node = state.node
-    # 1. Update last_fired and internal state
     new_node = %{node | last_fired: DateTime.utc_now(), head: %{node.head | internal_state: :high_energy}}
 
-    # 2. Reply to Coordinator
-    if type == :primary or score > 0.90, do: QueryCoordinator.node_fired(context.query_id, node.id, score, new_node)
+    if type == :primary or score > 0.90 do
+       QueryCoordinator.node_fired(Map.get(context, :query_id), node.id, score, new_node)
+    end
 
-    # 3. Broadcast Pulse (Spreading Activation)
-    # GAP 9 FIX: Calculate base_ttl handling :infinity for dependencies
     base_ttl =
       cond do
         type == :primary -> 2
         incoming_ttl == :infinity -> :infinity
-        true -> incoming_ttl - 1
+        is_integer(incoming_ttl) -> incoming_ttl - 1
+        true -> 0
       end
 
-    # Calculate the standard decay TTL based on antenna gain
     standard_out_ttl =
       if base_ttl == :infinity do
         :infinity
@@ -316,22 +351,13 @@ defmodule CMS.NodeActor do
         round(base_ttl * node.antenna.gain)
       end
 
-    # Check if we should propagate at all (either infinite or > 0)
     if standard_out_ttl == :infinity or standard_out_ttl > 0 do
-      new_trace = MapSet.put(context.trace, node.id)
+      new_trace = MapSet.put(Map.get(context, :trace, MapSet.new()), node.id)
 
       Enum.each(node.body.data_tail.relationship_metadata, fn edge ->
-        # Filter weak links
         if edge.weight > 0.1 do
-          # GAP 9 FIX: Override TTL for dependency links
-          edge_specific_ttl =
-            if edge.type == :dependency do
-              :infinity
-            else
-              standard_out_ttl
-            end
+          edge_specific_ttl = if edge.type == :dependency, do: :infinity, else: standard_out_ttl
 
-          # Only broadcast if this specific edge has life
           if edge_specific_ttl == :infinity or edge_specific_ttl > 0 do
             boost = calculate_associative_boost(score, edge, context)
 
@@ -353,8 +379,9 @@ defmodule CMS.NodeActor do
   end
 
   defp calculate_relevance(node, context) do
-    if node.head.embedding_model_version != context.embedding_model do
-      # Penalize model drift heavily
+    req_model = Map.get(context, :embedding_model, node.head.embedding_model_version)
+
+    if node.head.embedding_model_version != req_model do
       0.1
     else
       similarity(node, context)
@@ -362,17 +389,23 @@ defmodule CMS.NodeActor do
   end
 
   defp similarity(node, context) do
-    if context.query_vector do
+    query_vec = Map.get(context, :query_vector)
+
+    if query_vec do
       try do
-        # FIX: Used alias Embedder
-        Nx.dot(node.head.embedding, context.query_vector) |> Nx.to_number()
-      rescue _ -> 0.0 end
+        Nx.dot(node.head.embedding, query_vec) |> Nx.to_number()
+      rescue
+        _ -> 0.0
+      end
     else
-      String.jaro_distance(node.body.data_head.fact, context.query_text)
+      String.jaro_distance(
+        node.body.data_head.fact,
+        Map.get(context, :query_text, "")
+      )
     end
   end
 
-  @spec calculate_associative_boost(float(), Edge.t(), map()) :: float()
+  # --- TUNING FIX: Synaptic Damping to cure Hub Dominance ---
   defp calculate_associative_boost(current_relevance, edge, context) do
     type_factor = case edge.type do
       :dependency -> 1.0
@@ -388,7 +421,12 @@ defmodule CMS.NodeActor do
       _ -> 1.0
     end
 
-    current_relevance * edge.weight * type_factor * context_factor
+    # Damping Factor: 0.3
+    # Ensures associative links act as "contextual whispers" (0.3x strength)
+    # rather than "shouts", preventing Hub nodes from overpowering direct hits.
+    synaptic_resistance = 0.3
+
+    current_relevance * edge.weight * type_factor * context_factor * synaptic_resistance
   end
 
   defp calculate_total_link_weight(node) do
@@ -403,7 +441,7 @@ defmodule CMS.NodeActor do
   end
 
   defp reinforce_link(node, target_id, region_id) do
-    if Enum.any?(node.body.data_tail.relationship_metadata, fn e -> e.target_node_id == target_id end) do
+    if target_id and Enum.any?(node.body.data_tail.relationship_metadata, fn e -> e.target_node_id == target_id end) do
       RegionalHebbianBuffer.buffer_update(node.id, [{target_id, 0.05}], region_id)
     end
   end

@@ -15,7 +15,9 @@ defmodule CMS.BusPipeline do
       name: __MODULE__,
       producer: [
         module: {CMS.QueryRouter, []},
-        concurrency: 1
+        concurrency: 1,
+        # REMEDIATION: Transformer added to wrap raw events in Broadway.Message structs
+        transformer: {__MODULE__, :transform_entry, []}
       ],
       processors: [
         default: [
@@ -30,6 +32,17 @@ defmodule CMS.BusPipeline do
         ]
       ]
     )
+  end
+
+  @doc """
+  Transforms raw events from the producer into Broadway Messages.
+  Required because CMS.QueryRouter emits raw tuples, not structs.
+  """
+  def transform_entry(event, _opts) do
+    %Broadway.Message{
+      data: event,
+      acknowledger: {Broadway.NoopAcknowledger, nil, nil}
+    }
   end
 
   @impl true
@@ -60,17 +73,25 @@ defmodule CMS.BusPipeline do
   end
 
   defp do_broadcast(query_context, target_regions) do
+    query_id = Map.get(query_context, :query_id)
+
     # Broadcast to each target semantic region
     Enum.each(target_regions, fn region_id ->
       topic = "region:#{region_id}"
 
-      # The payload is the query context
+      # 1. The payload is the query context
       # NodeActors subscribed to this topic will wake up
       Phoenix.PubSub.broadcast(
         CMS.PubSub,
         topic,
         {:query, query_context}
       )
+
+      # 2. CRITICAL FIX: Notify Coordinator that this region has been contacted.
+      # Without this, QueryCoordinator waits for 10s timeout (Status 504).
+      if query_id do
+        CMS.QueryCoordinator.region_complete(query_id, region_id)
+      end
     end)
   end
 end

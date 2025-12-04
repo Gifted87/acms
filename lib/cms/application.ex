@@ -28,7 +28,9 @@ defmodule CMS.Application do
       CMS.IngestionEngine,
 
       # 6. The Node Population
-      CMS.NodeSupervisor
+      CMS.NodeSupervisor,
+
+      {CMS.Web, port: 4000}
     ]
 
     opts = [strategy: :one_for_one, name: CMS.Supervisor]

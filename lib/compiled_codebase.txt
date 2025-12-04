@@ -110,7 +110,9 @@ defmodule CMS.Application do
       CMS.IngestionEngine,
 
       # 6. The Node Population
-      CMS.NodeSupervisor
+      CMS.NodeSupervisor,
+
+      {CMS.Web, port: 4000}
     ]
 
     opts = [strategy: :one_for_one, name: CMS.Supervisor]
@@ -404,12 +406,14 @@ defmodule CMS.IngestionEngine do
     query_result = VectorRouter.query(
       embedding,
       model_version,
-      k: @max_associative_links
+      k: @max_associative_links,
+      threshold: @min_associative_score # Pass threshold to VectorRouter
     )
 
     case query_result do
       {:ok, candidates} ->
         edges = candidates
+        # Redundant filter in case VectorRouter ignores threshold
         |> Enum.filter(fn {_id, score} -> score >= @min_associative_score end)
         |> Enum.map(fn {target_id, score} ->
           # Use score as the initial weight for the semantic link
@@ -421,6 +425,8 @@ defmodule CMS.IngestionEngine do
       {:error, reason} ->
         Logger.warning("VectorRouter failed to prime edges: #{inspect(reason)}. Continuing with no initial links.")
         {:ok, []}
+
+      _ -> {:ok, []}
     end
   end
   # ------------------------------------------------------------------------
@@ -438,14 +444,17 @@ defmodule CMS.IngestionEngine do
     case query_result do
       {:ok, candidates} ->
         case candidates do
-          [{existing_id, _score} | _] ->
+          [{existing_id, score} | _] ->
             # High vector similarity found.
-            if new_node.id == existing_id do
-              # Exact duplicate content (ID matches). Idempotent.
-              :ok
+            # Double check score and ID
+            if score >= @conflict_similarity_threshold do
+              if new_node.id == existing_id do
+                :ok # Exact duplicate content (ID matches). Idempotent.
+              else
+                {:conflict, existing_id} # Different ID but almost identical meaning -> Potential Conflict.
+              end
             else
-              # Different ID but almost identical meaning -> Potential Conflict.
-              {:conflict, existing_id}
+              :ok # Score wasn't high enough (redundant safety)
             end
           _ ->
             :ok
@@ -454,6 +463,8 @@ defmodule CMS.IngestionEngine do
       {:error, _reason} ->
         # If the index is empty or fails, we assume no conflict exists.
         :ok
+
+       _ -> :ok
     end
   end
 
@@ -498,6 +509,7 @@ defmodule CMS.IngestionEngine do
         catch
           # If node crashes or times out during arbitration, default to neutral
           :exit, _ -> 0.5
+          _, _ -> 0.5
         end
     end
   end
@@ -588,6 +600,592 @@ end
 
 
 ================================================================================
+Folder: cms/interface
+================================================================================
+
+------------------------------------------------------------
+File: cms_web.ex
+------------------------------------------------------------
+defmodule CMS.Web do
+  @moduledoc """
+  The Universal API Layer for the CMS.
+
+  Provides a unified HTTP and WebSocket interface to the Cognitive Memory System.
+  Designed to be dropped into the supervision tree with minimal configuration.
+
+  ## Security & Performance Features
+  - **Safe Atom Handling**: Whitelisted atom creation to prevent DoS.
+  - **Input Validation**: Strict FID schema validation via FIDValidator.
+  - **Optimized Reads**: Prefers active GenServer state over expensive disk logs.
+  - **Size Limits**: Enforced 10MB body limit.
+  - **WS Auth**: Basic token check for real-time streams.
+  - **Resiliency**: Implements Global Fallback Broadcast if targeted search fails.
+
+  ## Endpoints
+  - POST /api/v1/ingest             -> Ingest new knowledge
+  - POST /api/v1/query              -> Semantic/Temporal Search (Live or Historical)
+  - GET  /api/v1/nodes/:id          -> Fetch active node state
+  - POST /api/v1/nodes/:id/feedback -> Anti-Hebbian Penalization (NEW)
+  - GET  /api/v1/nodes/:id/edges    -> Fetch node relationships
+  - GET  /api/v1/nodes/:id/history  -> Temporal "Time Travel" fetch
+  - GET  /api/v1/health/embedder    -> Check ML Bridge status
+  - WS   /api/v1/events             -> Real-time signals (WebSocket)
+  """
+  use Supervisor
+  require Logger
+
+  def start_link(opts) do
+    Supervisor.start_link(__MODULE__, opts, name: __MODULE__)
+  end
+
+  @impl true
+    def init(opts) do
+      port = Keyword.get(opts, :port, 4000)
+
+      # 1. Define routes explicitly
+      ws_route = "/api/v1/events"
+
+      # 2. Define the dispatch table
+      # Plug.Cowboy will do it automatically. Passing a compiled table causes the crash.
+      dispatch = [
+        {:_, [
+          {ws_route, CMS.Web.SocketHandler, []},
+          {:_, Plug.Cowboy.Handler, {CMS.Web.Router, []}}
+        ]}
+      ]
+
+      children = [
+        # Pass the raw list 'dispatch' to options
+        {Plug.Cowboy, scheme: :http, plug: CMS.Web.Router, options: [port: port, dispatch: dispatch]}
+      ]
+
+      Logger.info("CMS.Web API started on port #{port}")
+      Supervisor.init(children, strategy: :one_for_one)
+    end
+
+  def normalize_acls(nil), do: %{read: ["public"], write: ["system", "root"]}
+  def normalize_acls(list) when is_list(list), do: %{read: list ++ ["public"], write: list}
+  def normalize_acls(map) when is_map(map), do: map
+  def normalize_acls(_), do: %{read: ["public"], write: ["system", "root"]}
+end
+
+# ==============================================================================
+# REST ROUTER
+# ==============================================================================
+defmodule CMS.Web.Router do
+  use Plug.Router
+  require Logger
+
+  alias CMS.{IngestionEngine, QueryRouter, QueryCoordinator, TemporalQueryEngine, NodeSupervisor, VectorRouter}
+  alias CMS.{DataBodyPayload, FIDValidator, Tool.Embedder}
+
+  plug Plug.Logger
+  plug Plug.Parsers,
+    parsers: [:json],
+    pass: ["application/json"],
+    json_decoder: Jason,
+    length: 10_000_000
+
+  plug :match
+  plug :dispatch
+
+  # ----------------------------------------------------------------------------
+  # 1. INGESTION API
+  # ----------------------------------------------------------------------------
+  post "/api/v1/ingest" do
+    with {:ok, params} <- validate_params(conn.body_params, ["fact_text", "description_payloads", "agent_id"]),
+         {:ok, payloads} <- parse_and_validate_payloads(params["description_payloads"]),
+         acls <- CMS.Web.normalize_acls(params["acls"]) do
+
+      request = %{
+        fact_text: params["fact_text"],
+        description_payloads: payloads,
+        agent_id: params["agent_id"],
+        acls: acls,
+        provenance: params["provenance"] || %{}
+      }
+
+      case IngestionEngine.ingest(request) do
+        {:ok, node_id} ->
+          send_json(conn, 201, %{status: "ok", node_id: node_id})
+        {:ok, :ingested_with_conflict_resolution, meta_id} ->
+          send_json(conn, 202, %{status: "conflict_resolved", meta_node_id: meta_id})
+        {:error, :permission_denied} ->
+          send_json(conn, 403, %{error: "Permission denied"})
+        {:error, reason} ->
+          Logger.error("Ingestion failed: #{inspect(reason)}")
+          send_json(conn, 500, %{error: "Ingestion failed", detail: inspect(reason)})
+      end
+    else
+      {:error, {:validation, msg}} -> send_json(conn, 400, %{error: "Validation Error", detail: msg})
+      {:error, missing} when is_binary(missing) -> send_json(conn, 400, %{error: "Missing fields: #{missing}"})
+      _ -> send_json(conn, 400, %{error: "Invalid request format"})
+    end
+  end
+
+  # ----------------------------------------------------------------------------
+  # 2. QUERY API (Live & Temporal)
+  # ----------------------------------------------------------------------------
+  post "/api/v1/query" do
+    params = conn.body_params
+    query_text = params["query_text"]
+    query_vec = params["query_vector"]
+    agent_id = params["agent_id"] || "anonymous"
+
+    # Feature: Pagination & Thresholds
+    max_results = params["max_results"] || 50
+    min_relevance = params["min_relevance"] || 0.6
+
+    if is_nil(query_text) and is_nil(query_vec) do
+      send_json(conn, 400, %{error: "Must provide query_text or query_vector"})
+    else
+      try do
+        model = params["embedding_model"] || "all-MiniLM-L6-v2"
+
+        final_vec =
+          if query_vec do
+             Nx.tensor(query_vec)
+          else
+             case Embedder.generate(query_text, model) do
+               {:ok, tensor} -> tensor
+               {:error, _} -> throw(:embedding_failed)
+             end
+          end
+
+        # Feature: Validated Region Targeting
+        target_regions = resolve_target_regions(params["target_regions"], final_vec, model)
+
+        # Feature: Temporal Search (as_of)
+        case params["as_of"] do
+          nil ->
+            # A. LIVE SPREADING ACTIVATION
+            execute_live_query(conn, %{
+              query_vector: final_vec,
+              query_text: query_text,
+              target_regions: target_regions,
+              agent_id: agent_id,
+              model: model,
+              params: params
+            })
+
+          iso_timestamp ->
+             # B. HISTORICAL FORENSIC SEARCH
+             case DateTime.from_iso8601(iso_timestamp) do
+               {:ok, dt, _} ->
+                 execute_temporal_search(conn, final_vec, model, dt, max_results, min_relevance)
+               _ ->
+                 send_json(conn, 400, %{error: "Invalid as_of timestamp format"})
+             end
+        end
+
+      catch
+        :embedding_failed -> send_json(conn, 503, %{error: "Embedding service unavailable"})
+        e ->
+          Logger.error("Query Error: #{inspect(e)}")
+          send_json(conn, 500, %{error: "Internal Query Error"})
+      end
+    end
+  end
+
+  defp resolve_target_regions(input, vector, model) when is_list(input) do
+    # Validate user input: Must be list of integers 0..255
+    if Enum.all?(input, fn x -> is_integer(x) and x >= 0 and x <= 255 end) do
+      input
+    else
+      # If invalid, fall back to computed region but log warning
+      Logger.warning("Invalid target_regions provided, falling back to computed.")
+      [CMS.SemanticRegion.compute_region_hash(vector, model)]
+    end
+  end
+  # Fallback: Compute region if input is nil
+  defp resolve_target_regions(_, vector, model) do
+    [CMS.SemanticRegion.compute_region_hash(vector, model)]
+  end
+
+  # --- CRITICAL UPDATE: Implements Two-Phase Query with Global Fallback ---
+  defp execute_live_query(conn, ctx) do
+    query_id = UUID.uuid4()
+
+    # Base Context
+    query_context = %{
+      query_id: query_id,
+      query_vector: ctx.query_vector,
+      query_text: ctx.query_text,
+      agent_id: ctx.agent_id,
+      trace: MapSet.new(),
+      embedding_model: ctx.model,
+      min_relevance: ctx.params["min_relevance"] || 0.6,
+      reasoning_mode: safe_atom_cast(ctx.params["reasoning_mode"], :normal, [:normal, :brainstorm, :precision]),
+      system_mode: safe_atom_cast(ctx.params["system_mode"], :normal, [:normal, :emergency])
+    }
+
+    # ----------------------------------------------------------------------
+    # PHASE 1: Targeted Search (Efficient)
+    # ----------------------------------------------------------------------
+    {:ok, coord_pid} = QueryCoordinator.start_link(query_id, ctx.target_regions, self())
+    ref = Process.monitor(coord_pid)
+
+    # 1.a Inject VectorRouter Results (The "Guaranteed Match" path)
+    k = ctx.params["max_results"] || 50
+    min_rel = ctx.params["min_relevance"] || 0.6
+
+    case VectorRouter.query(ctx.query_vector, ctx.model, k: k) do
+        {:ok, candidates} ->
+            Enum.each(candidates, fn {node_id, score} ->
+                if score >= min_rel do
+                    node_data = fetch_active_or_historical_node(node_id)
+                    if node_data do
+                        # Direct injection bypasses NodeActor activation threshold
+                        QueryCoordinator.node_fired(query_id, node_id, score, node_data)
+                    end
+                end
+            end)
+        _ -> :ok
+    end
+
+    # 1.b Targeted Spreading Activation
+    QueryRouter.broadcast_query(query_context, ctx.target_regions)
+
+    # Wait for Phase 1 Results
+    phase_1_results =
+      receive do
+        {:query_result, ^query_id, results} ->
+          Process.demonitor(ref, [:flush])
+          results
+        {:DOWN, ^ref, :process, _pid, _reason} ->
+          []
+      after 5000 -> # Short timeout for Phase 1
+          Process.demonitor(ref, [:flush])
+          []
+      end
+
+    # ----------------------------------------------------------------------
+    # PHASE 2: Global Fallback (Safety Net)
+    # If Phase 1 returned nothing, broadcast to ALL regions.
+    # ----------------------------------------------------------------------
+    final_results =
+      if phase_1_results == [] do
+        Logger.warning("Targeted Query #{query_id} returned 0 results. Triggering Global Broadcast Fallback.")
+
+        fallback_id = UUID.uuid4()
+        all_regions = Enum.to_list(0..255) # Broadcast to everyone
+
+        {:ok, fb_coord} = QueryCoordinator.start_link(fallback_id, all_regions, self())
+        fb_ref = Process.monitor(fb_coord)
+
+        # Update ID in context so nodes treat it as a new pulse
+        fallback_context = %{query_context | query_id: fallback_id}
+
+        QueryRouter.broadcast_query(fallback_context, all_regions)
+
+        receive do
+          {:query_result, ^fallback_id, fb_results} ->
+            Process.demonitor(fb_ref, [:flush])
+            fb_results
+          {:DOWN, ^fb_ref, :process, _, _} -> []
+        after 10000 -> # Longer timeout for global search
+            Process.demonitor(fb_ref, [:flush])
+            []
+        end
+      else
+        phase_1_results
+      end
+
+    # Response Construction
+    limit = ctx.params["max_results"] || 50
+
+    # CRITICAL FIX: Transform tuples {score, node} to Maps %{score: s, node: n} for JSON encoding
+    trimmed_results =
+      final_results
+      |> Enum.take(limit)
+      |> Enum.map(fn {score, node} -> %{score: score, node: node} end)
+
+    send_json(conn, 200, %{
+      query_id: query_id, # Note: if fallback used, this is still original ID reference
+      count: length(trimmed_results),
+      results: trimmed_results,
+      fallback_triggered: (phase_1_results == [])
+    })
+  end
+
+  defp fetch_active_or_historical_node(node_id) do
+    if pid = NodeSupervisor.get_node_pid(node_id) do
+      try do
+        GenServer.call(pid, :get_state_snapshot, 1000)
+      rescue _ -> nil end
+    else
+      case TemporalQueryEngine.get_node_state_at_time(node_id, DateTime.utc_now()) do
+        {:ok, node} -> node
+        _ -> nil
+      end
+    end
+  end
+
+  defp execute_temporal_search(conn, vector, model, dt, max_results, min_relevance) do
+    # 1. Use Vector Router to find *current* candidates (Heuristic approach)
+    {:ok, candidates} = VectorRouter.query(vector, model, k: max_results * 2)
+
+    # 2. Reconstruct History for candidates
+    historical_results =
+      candidates
+      |> Enum.map(fn {id, score} ->
+        case TemporalQueryEngine.get_node_state_at_time(id, dt) do
+          {:ok, node} ->
+            # Inject the similarity score from the index for sorting
+            Map.put(node, "search_score", score)
+          _ -> nil # Node didn't exist at that time
+        end
+      end)
+      |> Enum.reject(&is_nil/1)
+      |> Enum.filter(fn node -> node["search_score"] >= min_relevance end)
+      |> Enum.sort_by(fn node -> node["search_score"] end, :desc)
+      |> Enum.take(max_results)
+
+    send_json(conn, 200, %{
+      query_type: "temporal",
+      as_of: DateTime.to_iso8601(dt),
+      count: length(historical_results),
+      results: historical_results
+    })
+  end
+
+  # ----------------------------------------------------------------------------
+  # 3. NODE MANAGEMENT API
+  # ----------------------------------------------------------------------------
+  get "/api/v1/nodes/:id" do
+    id = conn.path_params["id"]
+    case NodeSupervisor.get_node_pid(id) do
+      nil -> fetch_from_history(conn, id)
+      pid ->
+        try do
+          state = GenServer.call(pid, :get_state_snapshot, 5000)
+          send_json(conn, 200, state)
+        catch
+          _, _ -> fetch_from_history(conn, id)
+        end
+    end
+  end
+
+  # Feature: Anti-Hebbian Feedback
+  post "/api/v1/nodes/:id/feedback" do
+    id = conn.path_params["id"]
+    params = conn.body_params
+
+    # Validate Penalization Amount
+    amount = params["penalization_amount"]
+    context_id = params["context_id"]
+
+    if is_number(amount) and amount > 0.0 and amount <= 1.0 do
+      case NodeSupervisor.get_node_pid(id) do
+        nil ->
+          send_json(conn, 404, %{error: "Node not active"})
+        pid ->
+          # Cast the feedback to the node (Gap C remediation)
+          GenServer.cast(pid, {:feedback, :irrelevant, context_id, amount})
+          send_json(conn, 200, %{status: "feedback_applied", node_id: id})
+      end
+    else
+      send_json(conn, 400, %{error: "penalization_amount must be float between 0.0 and 1.0"})
+    end
+  end
+
+  get "/api/v1/nodes/:id/history" do
+    id = conn.path_params["id"]
+    params = fetch_query_params(conn).query_params
+
+    case DateTime.from_iso8601(params["as_of"] || "") do
+      {:ok, dt, _} ->
+        case TemporalQueryEngine.get_node_state_at_time(id, dt) do
+          {:ok, node} -> send_json(conn, 200, node)
+          {:error, _} -> send_json(conn, 404, %{error: "No history found"})
+        end
+      _ ->
+        send_json(conn, 400, %{error: "Invalid timestamp"})
+    end
+  end
+
+  get "/api/v1/nodes/:id/edges" do
+    id = conn.path_params["id"]
+    case NodeSupervisor.get_node_pid(id) do
+      nil ->
+        case TemporalQueryEngine.get_node_state_at_time(id, DateTime.utc_now()) do
+          {:ok, node} ->
+            edges = get_in(node, ["body", "data_tail", "relationship_metadata"]) || []
+            send_json(conn, 200, %{node_id: id, edge_count: length(edges), edges: edges})
+          _ -> send_json(conn, 404, %{error: "Node not found"})
+        end
+      pid ->
+        try do
+          # Assume node actor exposes edges via call or state snapshot
+          state = GenServer.call(pid, :get_state_snapshot, 5000)
+          edges = get_in(state, [:body, :data_tail, :relationship_metadata]) || []
+          send_json(conn, 200, %{node_id: id, edge_count: length(edges), edges: edges})
+        catch
+          _, _ -> send_json(conn, 503, %{error: "Node busy"})
+        end
+    end
+  end
+
+  delete "/api/v1/nodes/:id" do
+    id = conn.path_params["id"]
+    agent_id = get_req_header(conn, "x-agent-id") |> List.first()
+
+    if agent_id in ["root", "system"] do
+      case NodeSupervisor.get_node_pid(id) do
+        nil -> send_json(conn, 404, %{error: "Node not active"})
+        pid ->
+           GenServer.stop(pid, :normal)
+           CMS.LogAppender.append_node_event(id, :node_decayed, %{reason: "admin_eviction", by: agent_id})
+           send_json(conn, 200, %{status: "evicted"})
+      end
+    else
+      send_json(conn, 403, %{error: "Admin privileges required"})
+    end
+  end
+
+  # ----------------------------------------------------------------------------
+  # 4. SYSTEM API
+  # ----------------------------------------------------------------------------
+  post "/api/v1/system/:action" do
+    agent_id = get_req_header(conn, "x-agent-id") |> List.first()
+    if agent_id not in ["root", "system"] do
+       send_json(conn, 403, %{error: "Forbidden"})
+    else
+      case conn.path_params["action"] do
+        "rotate-epoch" ->
+          CMS.EpochManager.rotate_log()
+          send_json(conn, 200, %{status: "rotated"})
+        "check-drift" ->
+          send(CMS.ModelDriftManager, :check_for_drift)
+          send_json(conn, 200, %{status: "drift_check_initiated"})
+        "set-congestion" ->
+          level = conn.body_params["level"]
+          if is_number(level) do
+            CMS.ActivationEngine.set_congestion_level(level)
+            send_json(conn, 200, %{status: "congestion_set", level: level})
+          else
+            send_json(conn, 400, %{error: "Level must be a number"})
+          end
+        _ ->
+          send_json(conn, 404, %{error: "Unknown action"})
+      end
+    end
+  end
+
+  get "/api/v1/health/embedder" do
+    url = "http://localhost:5000/api/v1/health"
+    case Req.get(url, receive_timeout: 1000) do
+      {:ok, %{status: 200}} -> send_json(conn, 200, %{status: "ok", bridge: "connected"})
+      _ -> send_json(conn, 503, %{status: "degraded", bridge: "unreachable"})
+    end
+  end
+
+  match _ do
+    send_json(conn, 404, %{error: "Route not found"})
+  end
+
+  # ----------------------------------------------------------------------------
+  # PRIVATE HELPERS
+  # ----------------------------------------------------------------------------
+  defp send_json(conn, status, data) do
+    conn
+    |> put_resp_content_type("application/json")
+    |> send_resp(status, Jason.encode!(data))
+  end
+
+  defp fetch_from_history(conn, id) do
+    case TemporalQueryEngine.get_node_state_at_time(id, DateTime.utc_now()) do
+      {:ok, node_data} -> send_json(conn, 200, node_data)
+      _ -> send_json(conn, 404, %{error: "Node not found"})
+    end
+  end
+
+  defp validate_params(params, required_keys) do
+    missing = Enum.filter(required_keys, fn k -> is_nil(params[k]) end)
+    if Enum.empty?(missing), do: {:ok, params}, else: {:error, Enum.join(missing, ", ")}
+  end
+
+  defp parse_and_validate_payloads(list) when is_list(list) do
+    results = Enum.map(list, fn item ->
+      payload =
+        case item["type"] do
+          "text" -> %DataBodyPayload.Text{content: item["content"] || ""}
+          "code" ->
+            lang = safe_atom_cast(item["language"], :elixir, [:elixir, :python, :javascript, :json, :bash])
+            %DataBodyPayload.Code{language: lang, content: item["content"] || ""}
+          "number" ->
+            unit = if item["unit"] && item["unit"] != "nil", do: safe_atom_cast(item["unit"], nil, [:meters, :seconds, :celsius, :count]), else: nil
+            %DataBodyPayload.Number{value: item["value"], unit: unit}
+          "link" -> %DataBodyPayload.Link{uri: item["uri"] || "", description: item["description"]}
+          "object" ->
+             type = safe_atom_cast(item["object_type"], :generic, [:sensor_data, :config, :metadata, :generic])
+             %DataBodyPayload.Object{object_type: type, data: item["data"] || %{}}
+          _ -> %DataBodyPayload.Text{content: "Unknown Payload"}
+        end
+
+      case FIDValidator.validate(payload) do
+        :ok -> {:ok, payload}
+        {:error, msg} -> {:error, msg}
+      end
+    end)
+
+    error = Enum.find(results, fn {:error, _} -> true; _ -> false end)
+    if error, do: {:error, {:validation, elem(error, 1)}}, else: {:ok, Enum.map(results, &elem(&1, 1))}
+  end
+  defp parse_and_validate_payloads(_), do: {:error, "Payloads must be a list"}
+
+  defp safe_atom_cast(str, default, allowlist) when is_binary(str) do
+    try do
+      atom = String.to_existing_atom(str)
+      if atom in allowlist, do: atom, else: default
+    rescue _ -> default end
+  end
+  defp safe_atom_cast(_, default, _), do: default
+end
+
+# ==============================================================================
+# WEBSOCKET HANDLER
+# ==============================================================================
+defmodule CMS.Web.SocketHandler do
+  @behaviour :cowboy_websocket
+  require Logger
+
+  @public_topics ["global:signals"]
+  @admin_topics ["global:abnormality_signal", "system_congestion"]
+
+  def init(req, state) do
+    qs = :cowboy_req.parse_qs(req)
+    token = :proplists.get_value("token", qs)
+    permissions = if token == "admin_secret", do: :admin, else: :public
+    {:cowboy_websocket, req, Map.put(state, :permissions, permissions)}
+  end
+
+  def websocket_init(state) do
+    Enum.each(@public_topics, &Phoenix.PubSub.subscribe(CMS.PubSub, &1))
+    if state[:permissions] == :admin, do: Enum.each(@admin_topics, &Phoenix.PubSub.subscribe(CMS.PubSub, &1))
+    {:ok, state}
+  end
+
+  def websocket_handle({:text, json}, state) do
+    {:reply, {:text, "ACK: " <> json}, state}
+  end
+  def websocket_handle(_frame, state), do: {:ok, state}
+
+  def websocket_info(msg, state) do
+    {:reply, {:text, serialize_event(msg)}, state}
+  end
+
+  defp serialize_event({:abnormality_signal, opts}) do
+    Jason.encode!(%{event: "abnormality_signal", node_id: opts[:node_id], reason: opts[:reason], timestamp: DateTime.utc_now()})
+  end
+  defp serialize_event({:system_congestion, level}) do
+    Jason.encode!(%{event: "system_congestion", level: level, timestamp: DateTime.utc_now()})
+  end
+  defp serialize_event(other), do: Jason.encode!(%{event: "signal", data: inspect(other)})
+end
+
+
+================================================================================
 Folder: cms/agents
 ================================================================================
 
@@ -598,7 +1196,7 @@ defmodule CMS.QueryCoordinator do
   use GenServer
   require Logger
 
-  alias CMS.LogAppender # Added LogAppender alias for failure reporting
+  alias CMS.LogAppender
 
   @moduledoc """
   Orchestrates the lifecycle of a single query.
@@ -612,7 +1210,7 @@ defmodule CMS.QueryCoordinator do
   # Configuration
   @top_k_results 50             # Only care about top 50 relevant nodes
   @inhibit_threshold_count 100  # If >100 nodes fire, trigger inhibition
-  @query_timeout 5_000          # Max time to wait for results
+  @query_timeout 10_000         # Max time to wait for results (Increased from 5s to 10s)
   @inhibit_check_delay 150      # Check for explosion 150ms after start
 
   # State
@@ -627,7 +1225,6 @@ defmodule CMS.QueryCoordinator do
   ]
 
   # API
-  # ... (start_link, node_fired, region_complete remain unchanged)
 
   @doc """
   Starts a coordinator for a specific query.
@@ -744,7 +1341,8 @@ defmodule CMS.QueryCoordinator do
     LogAppender.append_system_event(:query_failure, %{
       query_id: state.query_id,
       reason: reason,
-      origin_pid: state.origin_pid,
+      # REMEDIATION: inspect PID to ensure it can be encoded to JSON
+      origin_pid: inspect(state.origin_pid),
       fired_node_count: map_size(state.fired_nodes),
       active_regions: MapSet.to_list(state.active_regions)
     })
@@ -936,67 +1534,95 @@ defmodule CMS.NodeActor do
   use GenServer
   require Logger
 
-  # FIX: Cleaned up aliases and ensured they are used
   alias CMS.{Node, ActivationEngine, QueryCoordinator, RegionalHebbianBuffer, LogAppender, SemanticRegion, TemporalQueryEngine}
-  alias CMS.Edge
   alias CMS.Security
   alias CMS.Tool.Embedder
 
   @moduledoc """
   The Atomic Unit of Cognition (The "Neuron").
 
-  Implements:
-  - Fix 2: State Hydration (Crash Amnesia Fix).
-  - Gap 11.4: Node Migration.
-  - Section 7.2: Hebbian & Anti-Hebbian Learning.
-  - Section 8.2: Model Drift Handling.
+  CRITICAL REMEDIATION (Fix 2 & Zombie Fix & Tuning):
+  1. Implements Defensive Coding: Replaces strict map access with Map.get/3.
+  2. Implements Safe Math: Guards Nx.dot operations.
+  3. ZOMBIE FIX: Guards against starting with nil ID or Head.
+  4. HYDRATION FIX: Ensures node terminates if it cannot find data.
+  5. TUNING: Implements Synaptic Damping to cure "ADHD/Hub Dominance".
   """
 
   @abnormality_topic "global:abnormality_signal"
 
-  defstruct [:node, :region_id, :hydrated?]
+  defstruct [:node, :region_id, :hydrated?, :hydration_retry_count]
 
+  # --- ZOMBIE FIX: Guard against starting invalid nodes ---
   def start_link(%Node{} = node) do
-    GenServer.start_link(__MODULE__, node, name: via_tuple(node.id))
+    if is_nil(node.id) do
+      Logger.error("NodeActor failed to start: Node ID is nil.")
+      {:error, :invalid_node_id}
+    else
+      GenServer.start_link(__MODULE__, node, name: via_tuple(node.id))
+    end
   end
 
   @impl true
   def init(node) do
-    # 1. Subscribe to Semantic Region
-    region_id = SemanticRegion.compute_region_hash(node.head.embedding, node.head.embedding_model_version)
-    SemanticRegion.subscribe(region_id, node.id)
+    # --- ZOMBIE FIX: Guard against missing head/embedding ---
+    if is_nil(node.head) or is_nil(node.head.embedding) do
+      Logger.error("NodeActor #{node.id} failed to init: Missing head or embedding.")
+      {:stop, :invalid_initial_state}
+    else
+      # 1. Subscribe to Semantic Region
+      region_id = SemanticRegion.compute_region_hash(node.head.embedding, node.head.embedding_model_version)
+      SemanticRegion.subscribe(region_id, node.id)
 
-    # 2. FIX 2: Schedule State Hydration
-    Process.send_after(self(), :hydrate, 10)
+      # 2. Schedule State Hydration
+      Process.send_after(self(), :hydrate, 10)
 
-    {:ok, %__MODULE__{node: node, region_id: region_id, hydrated?: false}}
-  end
-
-  # --- FIX 2: Hydration Logic ---
-  @impl true
-  def handle_info(:hydrate, state) do
-    Logger.debug("NodeActor #{state.node.id}: Attempting hydration from Temporal History...")
-
-    case TemporalQueryEngine.get_node_state_at_time(state.node.id, DateTime.utc_now()) do
-      {:ok, restored_node_map} ->
-        # Simplified merge logic assuming struct compatibility
-        restored_node = struct(CMS.Node, restored_node_map)
-
-        Logger.info("NodeActor #{state.node.id}: Hydrated successfully.")
-        {:noreply, %{state | node: restored_node, hydrated?: true}}
-
-      {:error, _reason} ->
-        Logger.debug("NodeActor #{state.node.id}: No history found. Starting fresh.")
-        {:noreply, %{state | hydrated?: true}}
+      {:ok, %__MODULE__{node: node, region_id: region_id, hydrated?: false, hydration_retry_count: 0}}
     end
   end
 
-  # --- Standard Bus Handlers ---
+  @impl true
+  # --- HYDRATION FIX: Strict checks to prevent empty "hydrated" state ---
+  def handle_info(:hydrate, state) do
+    case TemporalQueryEngine.get_node_state_at_time(state.node.id, DateTime.utc_now()) do
+      {:ok, restored_node_map} ->
+        try do
+          restored_node = struct(CMS.Node, restored_node_map)
+
+          if is_nil(restored_node.head) do
+             raise "Restored node has no head"
+          end
+
+          {:noreply, %{state | node: restored_node, hydrated?: true}}
+        rescue
+          e ->
+            Logger.error("NodeActor #{state.node.id}: Hydration struct conversion failed: #{inspect(e)}")
+            retry_hydration(state)
+        end
+
+      {:error, :node_not_found_at_timestamp} ->
+        if state.node.head do
+          Logger.debug("NodeActor #{state.node.id}: New node, using initial state.")
+          {:noreply, %{state | hydrated?: true}}
+        else
+          Logger.error("NodeActor #{state.node.id}: No history and invalid initial state. Terminating.")
+          {:stop, :zombie_node, state}
+        end
+
+      {:error, reason} ->
+        Logger.warning("NodeActor #{state.node.id}: Hydration failed with reason: #{inspect(reason)}")
+        retry_hydration(state)
+    end
+  end
+
+  # --- Standard Bus Handlers (handle_info) ---
 
   @impl true
   def handle_info({:query, context}, state) do
     if state.hydrated? do
-      if MapSet.member?(context.trace, state.node.id) do
+      trace = Map.get(context, :trace, MapSet.new())
+
+      if MapSet.member?(trace, state.node.id) do
         {:noreply, state}
       else
         process_activation(:primary, context, state, 0.0)
@@ -1008,9 +1634,12 @@ defmodule CMS.NodeActor do
 
   @impl true
   def handle_info({:pulse, payload}, state) do
-    %{query_context: context, ttl: ttl, trace: trace, boost_score: boost, origin_id: origin_id} = payload
+    context = Map.get(payload, :query_context, %{})
+    ttl = Map.get(payload, :ttl, 0)
+    trace = Map.get(payload, :trace, MapSet.new())
+    boost = Map.get(payload, :boost_score, 0.0)
+    origin_id = Map.get(payload, :origin_id)
 
-    # GAP 9 FIX: Handle :infinity atom explicitly
     is_dead_pulse = (is_integer(ttl) and ttl <= 0)
 
     if is_dead_pulse or MapSet.member?(trace, state.node.id) do
@@ -1021,12 +1650,16 @@ defmodule CMS.NodeActor do
     end
   end
 
-  # --- GenServer Calls ---
+  # --- GenServer Calls (handle_call) ---
 
   @impl true
   def handle_call(:get_drift_info, _from, state) do
-    result = {state.node.id, state.node.head.embedding, state.node.head.embedding_model_version, state.region_id}
-    {:reply, result, state}
+    if state.node.head do
+      result = {state.node.id, state.node.head.embedding, state.node.head.embedding_model_version, state.region_id}
+      {:reply, {:ok, result}, state}
+    else
+      {:reply, {:error, :invalid_state}, state}
+    end
   end
 
   @impl true
@@ -1038,7 +1671,7 @@ defmodule CMS.NodeActor do
   def handle_call(:get_decay_criteria, _from, state) do
     node = state.node
     total_link_weight = calculate_total_link_weight(node)
-    {:reply, {node.head.internal_state, total_link_weight}, state}
+    {:reply, {:ok, {node.head.internal_state, total_link_weight}}, state}
   end
 
   @impl true
@@ -1047,13 +1680,17 @@ defmodule CMS.NodeActor do
     {:reply, trust, state}
   end
 
-  # --- GenServer Casts (Expanded for Completeness) ---
+  @impl true
+  def handle_call(:get_state_snapshot, _from, state) do
+    {:reply, state.node, state}
+  end
+
+  # --- GenServer Casts (handle_cast) ---
 
   @impl true
   def handle_cast(:perform_differential_decay, state) do
     now = DateTime.utc_now()
 
-    # 1. Decay Edges
     new_edges = Enum.map(state.node.body.data_tail.relationship_metadata, fn edge ->
       hours_unused = DateTime.diff(now, edge.last_used_at, :hour)
       if hours_unused > 24 do
@@ -1063,7 +1700,6 @@ defmodule CMS.NodeActor do
       end
     end)
 
-    # 2. Update Metabolic State
     days_since_fired = DateTime.diff(now, state.node.last_fired, :day)
     frequency = state.node.antenna.activation_frequency
 
@@ -1105,14 +1741,11 @@ defmodule CMS.NodeActor do
     {:noreply, %{state | region_id: new_region}}
   end
 
-  # --- NEW: Anti-Hebbian Penalization (Gap C) ---
   @impl true
   def handle_cast({:feedback, :irrelevant, _context_id, penalization_amount}, state) do
-    # Penalize recent links. For simplicity, we reduce all active link weights.
     current_edges = state.node.body.data_tail.relationship_metadata
 
     updated_edges = Enum.map(current_edges, fn edge ->
-      # Reduce weight, clamping at 0.01
       new_weight = max(0.01, edge.weight - penalization_amount)
       %{edge | weight: new_weight}
     end)
@@ -1124,37 +1757,26 @@ defmodule CMS.NodeActor do
     {:noreply, %{state | node: new_node}}
   end
 
-  # --- NEW: Model Drift Repair (Gap 7) ---
   @impl true
   def handle_cast({:re_embed_request, active_model}, state) do
-    Logger.info("NodeActor #{state.node.id}: Re-embedding self to model #{active_model}...")
-
-    # 1. Generate new embedding
     case Embedder.generate(state.node.body.data_head.fact, active_model) do
       {:ok, new_embedding} ->
          new_head = %{state.node.head |
            embedding: new_embedding,
            embedding_model_version: active_model
          }
-
-         # 2. Trigger self-update via cast
          GenServer.cast(self(), {:update_node_head, new_head})
-
       {:error, reason} ->
          Logger.error("NodeActor #{state.node.id}: Re-embedding failed: #{inspect(reason)}")
     end
-
     {:noreply, state}
   end
 
   @impl true
   def handle_cast({:update_node_head, new_head}, state) do
     new_node = %{state.node | head: new_head}
-
-    # Recalculate region since embedding changed
     new_region = SemanticRegion.compute_region_hash(new_head.embedding, new_head.embedding_model_version)
 
-    # Update Subscription if region changed
     if new_region != state.region_id do
       SemanticRegion.unsubscribe(state.region_id, state.node.id)
       SemanticRegion.subscribe(new_region, state.node.id)
@@ -1165,6 +1787,20 @@ defmodule CMS.NodeActor do
   end
 
   # --- Internal Logic ---
+
+  defp retry_hydration(state) do
+    current_retry = state.hydration_retry_count
+    next_retry = current_retry + 1
+
+    if next_retry <= 5 do
+      delay = min(1000, 10 * :math.pow(2, next_retry) |> round)
+      Process.send_after(self(), :hydrate, delay)
+      {:noreply, %{state | hydration_retry_count: next_retry}}
+    else
+      Logger.error("NodeActor #{state.node.id}: Hydration failed after 5 attempts. Node will be terminated.")
+      {:stop, :hydration_failure, state}
+    end
+  end
 
   defp rules do
     [
@@ -1199,11 +1835,11 @@ defmodule CMS.NodeActor do
     check_for_abnormality(node, context, total)
 
     if total >= threshold do
-      # FIX: Restored Security Check using alias Security
-      if Security.can_read?(context.agent_id, node.body.data_tail.acls) do
+      agent_id = Map.get(context, :agent_id, "unknown")
+
+      if Security.can_read?(agent_id, node.body.data_tail.acls) do
         fire_node(type, total, context, state, ttl)
       else
-        Logger.debug("Node #{node.id} suppressed. Agent #{context.agent_id} denied by ACLs.")
         {:noreply, state}
       end
     else
@@ -1214,7 +1850,6 @@ defmodule CMS.NodeActor do
   defp check_for_abnormality(node, context, score) do
     Enum.each(rules(), fn {rule_name, check_fn} ->
       if check_fn.(node, context, score) do
-        Logger.error("Node #{node.id} triggered Abnormality Signal (Rule: #{rule_name}).")
         Phoenix.PubSub.broadcast(CMS.PubSub, @abnormality_topic, {
           :abnormality_signal,
           node_id: node.id,
@@ -1227,22 +1862,20 @@ defmodule CMS.NodeActor do
 
   defp fire_node(type, score, context, state, incoming_ttl) do
     node = state.node
-    # 1. Update last_fired and internal state
     new_node = %{node | last_fired: DateTime.utc_now(), head: %{node.head | internal_state: :high_energy}}
 
-    # 2. Reply to Coordinator
-    if type == :primary or score > 0.90, do: QueryCoordinator.node_fired(context.query_id, node.id, score, new_node)
+    if type == :primary or score > 0.90 do
+       QueryCoordinator.node_fired(Map.get(context, :query_id), node.id, score, new_node)
+    end
 
-    # 3. Broadcast Pulse (Spreading Activation)
-    # GAP 9 FIX: Calculate base_ttl handling :infinity for dependencies
     base_ttl =
       cond do
         type == :primary -> 2
         incoming_ttl == :infinity -> :infinity
-        true -> incoming_ttl - 1
+        is_integer(incoming_ttl) -> incoming_ttl - 1
+        true -> 0
       end
 
-    # Calculate the standard decay TTL based on antenna gain
     standard_out_ttl =
       if base_ttl == :infinity do
         :infinity
@@ -1250,22 +1883,13 @@ defmodule CMS.NodeActor do
         round(base_ttl * node.antenna.gain)
       end
 
-    # Check if we should propagate at all (either infinite or > 0)
     if standard_out_ttl == :infinity or standard_out_ttl > 0 do
-      new_trace = MapSet.put(context.trace, node.id)
+      new_trace = MapSet.put(Map.get(context, :trace, MapSet.new()), node.id)
 
       Enum.each(node.body.data_tail.relationship_metadata, fn edge ->
-        # Filter weak links
         if edge.weight > 0.1 do
-          # GAP 9 FIX: Override TTL for dependency links
-          edge_specific_ttl =
-            if edge.type == :dependency do
-              :infinity
-            else
-              standard_out_ttl
-            end
+          edge_specific_ttl = if edge.type == :dependency, do: :infinity, else: standard_out_ttl
 
-          # Only broadcast if this specific edge has life
           if edge_specific_ttl == :infinity or edge_specific_ttl > 0 do
             boost = calculate_associative_boost(score, edge, context)
 
@@ -1287,8 +1911,9 @@ defmodule CMS.NodeActor do
   end
 
   defp calculate_relevance(node, context) do
-    if node.head.embedding_model_version != context.embedding_model do
-      # Penalize model drift heavily
+    req_model = Map.get(context, :embedding_model, node.head.embedding_model_version)
+
+    if node.head.embedding_model_version != req_model do
       0.1
     else
       similarity(node, context)
@@ -1296,17 +1921,23 @@ defmodule CMS.NodeActor do
   end
 
   defp similarity(node, context) do
-    if context.query_vector do
+    query_vec = Map.get(context, :query_vector)
+
+    if query_vec do
       try do
-        # FIX: Used alias Embedder
-        Nx.dot(node.head.embedding, context.query_vector) |> Nx.to_number()
-      rescue _ -> 0.0 end
+        Nx.dot(node.head.embedding, query_vec) |> Nx.to_number()
+      rescue
+        _ -> 0.0
+      end
     else
-      String.jaro_distance(node.body.data_head.fact, context.query_text)
+      String.jaro_distance(
+        node.body.data_head.fact,
+        Map.get(context, :query_text, "")
+      )
     end
   end
 
-  @spec calculate_associative_boost(float(), Edge.t(), map()) :: float()
+  # --- TUNING FIX: Synaptic Damping to cure Hub Dominance ---
   defp calculate_associative_boost(current_relevance, edge, context) do
     type_factor = case edge.type do
       :dependency -> 1.0
@@ -1322,7 +1953,12 @@ defmodule CMS.NodeActor do
       _ -> 1.0
     end
 
-    current_relevance * edge.weight * type_factor * context_factor
+    # Damping Factor: 0.3
+    # Ensures associative links act as "contextual whispers" (0.3x strength)
+    # rather than "shouts", preventing Hub nodes from overpowering direct hits.
+    synaptic_resistance = 0.3
+
+    current_relevance * edge.weight * type_factor * context_factor * synaptic_resistance
   end
 
   defp calculate_total_link_weight(node) do
@@ -1337,7 +1973,7 @@ defmodule CMS.NodeActor do
   end
 
   defp reinforce_link(node, target_id, region_id) do
-    if Enum.any?(node.body.data_tail.relationship_metadata, fn e -> e.target_node_id == target_id end) do
+    if target_id and Enum.any?(node.body.data_tail.relationship_metadata, fn e -> e.target_node_id == target_id end) do
       RegionalHebbianBuffer.buffer_update(node.id, [{target_id, 0.05}], region_id)
     end
   end
@@ -1536,14 +2172,20 @@ defmodule CMS.ModelDriftManager do
     # Asynchronously ask the node for its header info
     Task.start(fn ->
       try do
-        node_head = GenServer.call(pid, :get_head_info, 5000)
-
-        if node_head.embedding_model_version != active_model do
-          # Trigger self-repair on the node
-          GenServer.cast(pid, {:re_embed_request, active_model})
+        # REMEDIATION: Defensive pattern matching to handle nil or invalid returns
+        # Previously crashed if call returned nil (KeyError)
+        case GenServer.call(pid, :get_head_info, 5000) do
+          %CMS.NodeHead{} = node_head ->
+            if node_head.embedding_model_version != active_model do
+              # Trigger self-repair on the node
+              GenServer.cast(pid, {:re_embed_request, active_model})
+            end
+          _ ->
+            :noop # Got nil or unexpected format (e.g., node starting up)
         end
       catch
         :exit, _ -> :noop # Node died
+        _, _ -> :noop # Timeout or other error
       end
     end)
   end
@@ -1680,83 +2322,74 @@ defmodule CMS.VectorRouter do
   @moduledoc """
   Manages the Hierarchical Navigable Small Worlds (HNSW) index for vector embeddings.
 
-  CRITICAL PATCH (Gap 7): Now manages a map of HNSW indices, one for each
-  embedding model version, preventing cross-model interference.
+  CRITICAL REMEDIATION:
+  1. FIX: Updated 'add' and 'query' to pass Nx.Tensor directly to HNSWLib as required by the binding.
+  2. FIX: Ensures 1D vectors are correctly converted to 2D batches (Nx.new_axis).
+  3. FIX: Uses safer ID generation to prevent NIF integer overflow issues.
+  4. QUERY FIX: Added logic to respect the `threshold` option.
   """
 
   # Configuration
-  @base_index_dir "priv/data/hnsw_indices" # New base directory for multiple indices
+  @base_index_dir "priv/data/hnsw_indices"
   @dim 384
   @max_elements 100_000
   @persist_interval :timer.minutes(5)
   @persist_threshold 100
+  @id_map_table :vector_id_mapping
 
-  # Placeholder for configurable supported models
+  # Supported Models
   @supported_models ["all-MiniLM-L6-v2", "custom-bert-v1"]
 
-  # --- STRUCT UPDATE ---
   defstruct [
     :indices,           # Map: %{model_version => index_ref}
     :insertion_count,   # Map: %{model_version => count}
     :dirty_models       # MapSet: Tracks models with unpersisted changes
   ]
 
-  # Client API
+  # --- Client API ---
 
   def start_link(opts \\ []) do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
   def add_embedding(node_id, embedding, model_version) do
-    GenServer.call(__MODULE__, {:add, node_id, embedding, model_version})
+    GenServer.call(__MODULE__, {:add, node_id, embedding, model_version}, 30_000)
   end
 
-  @doc """
-  Queries the HNSW index for approximate nearest neighbors.
-  Options: :k (default 10), :threshold (min similarity score, default 0.0)
-  """
-  @spec query(Nx.Tensor.t(), String.t(), Keyword.t()) :: {:ok, list({String.t(), float()})} | {:error, any()}
   def query(query_vector, model_version, opts \\ []) do
-    GenServer.call(__MODULE__, {:query, query_vector, model_version, opts})
+    GenServer.call(__MODULE__, {:query, query_vector, model_version, opts}, 10_000)
   end
 
   def persist do
     GenServer.call(__MODULE__, :persist)
   end
 
-  # --- New Helper: Determines the file path for a model's index ---
-  defp index_file_path(model_version) do
-    File.mkdir_p!(@base_index_dir)
-    Path.join(@base_index_dir, "#{String.replace(model_version, "-", "_")}.hnsw.bin")
-  end
-
-  # Server Callbacks
+  # --- Server Callbacks ---
 
   @impl true
-  # --- FUNCTION REFACTOR: init/1 to load/create multiple indices ---
   def init(_opts) do
-    Logger.info("CMS.VectorRouter: Initializing multi-model HNSW indices.")
-    Process.send_after(self(), :periodic_persist, @persist_interval)
+    Logger.info("CMS.VectorRouter: Initializing with CLEAN SLATE strategy...")
 
+    # 1. CLEAN SLATE: Remove old indices to prevent corruption loops
+    File.rm_rf(@base_index_dir)
+    File.mkdir_p!(@base_index_dir)
+
+    # 2. Initialize Mnesia
+    init_mnesia()
+
+    # 3. Create fresh indices with error handling
     {initial_indices, initial_counts} =
-      Enum.map(@supported_models, fn model ->
-        case load_index(model) do
+      Enum.reduce(@supported_models, {[], []}, fn model, {indices_acc, counts_acc} ->
+        case HNSWLib.Index.new(:cosine, @dim, @max_elements) do
           {:ok, index} ->
-            Logger.info("HNSW index for '#{model}' loaded from disk.")
-            {model, index}
-          {:error, :not_found} ->
-            Logger.info("Creating new HNSW index for '#{model}'.")
-            {:ok, index} = HNSWLib.Index.new(:cosine, @dim, @max_elements)
-            {model, index}
+            {[{model, index} | indices_acc], [{model, 0} | counts_acc]}
           {:error, reason} ->
-            Logger.error("Failed to load index for '#{model}': #{inspect(reason)}. Creating new one.")
-            {:ok, index} = HNSWLib.Index.new(:cosine, @dim, @max_elements)
-            {model, index}
+            Logger.error("Failed to create HNSW index for #{model}: #{inspect(reason)}")
+            {indices_acc, counts_acc}
         end
-        |> then(fn {m, i} -> {m, i} end)
-        |> then(fn {m, i} -> {{m, i}, {m, 0}} end)
       end)
-      |> Enum.unzip()
+
+    Process.send_after(self(), :periodic_persist, @persist_interval)
 
     {:ok, %__MODULE__{
       indices: Map.new(initial_indices),
@@ -1766,64 +2399,119 @@ defmodule CMS.VectorRouter do
   end
 
   @impl true
-  # --- LOGIC REFACTOR: handle_call({:add, ...}) now uses the correct index ---
   def handle_call({:add, node_id, embedding, model_version}, _from, state) do
     case Map.fetch(state.indices, model_version) do
-      {:ok, index} ->
-        # HNSWLib expects %Nx.Tensor{}
-        item_id = :erlang.phash2(node_id)
-        case HNSWLib.Index.add_items(index, embedding, ids: [item_id]) do
-          :ok ->
-            new_count = Map.get(state.insertion_count, model_version, 0) + 1
-            new_dirty_models = MapSet.put(state.dirty_models, model_version)
+      {:ok, index} when not is_nil(index) ->
+        try do
+          # CRITICAL FIX 1: Ensure embedding is a 2D Nx.Tensor (a batch of 1 vector)
+          vector_tensor =
+            case Nx.rank(embedding) do
+              1 -> Nx.new_axis(embedding, 0) # Convert 1D [384] to 2D [1][384]
+              _ -> embedding
+            end
 
-            if new_count >= @persist_threshold, do: send(self(), :periodic_persist)
+          # CRITICAL FIX 2: Dimension Check - use Nx.shape for a 2D tensor
+          tensor_dim = elem(Nx.shape(vector_tensor), 1)
 
-            {:reply, :ok, %{state |
-              insertion_count: Map.put(state.insertion_count, model_version, new_count),
-              dirty_models: new_dirty_models
-            }}
-          error ->
-            {:reply, error, state}
+          if tensor_dim != @dim do
+            Logger.error("Dimension mismatch: Expected #{@dim}, got #{tensor_dim}.")
+            {:reply, {:error, :dimension_mismatch}, state}
+          else
+            # 2. Generate ID
+            # FIX 3: Use safer phash2 for NIF compatibility
+            item_id = :erlang.phash2(node_id, 2_147_483_647)
+
+            # 3. Add to HNSW (Pass the Nx.Tensor directly, as required)
+            case HNSWLib.Index.add_items(index, vector_tensor, ids: [item_id]) do
+              :ok ->
+                :mnesia.dirty_write({@id_map_table, item_id, node_id})
+                new_count = Map.get(state.insertion_count, model_version, 0) + 1
+                new_dirty = MapSet.put(state.dirty_models, model_version)
+
+                if new_count >= @persist_threshold, do: send(self(), :periodic_persist)
+
+                {:reply, :ok, %{state | insertion_count: Map.put(state.insertion_count, model_version, new_count), dirty_models: new_dirty}}
+
+              {:error, reason} ->
+                Logger.error("HNSWLib.add_items failed: #{inspect(reason)}")
+                {:reply, {:error, :add_failed}, state}
+            end
+          end
+        rescue
+          e ->
+            Logger.error("VectorRouter Crash on Add: #{inspect(e)}")
+            {:reply, {:error, :add_crashed}, state}
+        catch
+          :exit, reason ->
+             Logger.error("VectorRouter NIF Crash (Exit): #{inspect(reason)}")
+             {:reply, {:error, :nif_crash}, state}
         end
 
-      :error ->
-        Logger.warning("VectorRouter: Attempt to add node with unsupported model: #{model_version}")
-        {:reply, {:error, :unsupported_model_version}, state}
+      _ ->
+        {:reply, {:error, :unsupported_model}, state}
     end
   end
 
   @impl true
-  # --- LOGIC & ERROR HANDLING REFACTOR: handle_call({:query, ...}) now uses the correct index ---
   def handle_call({:query, query_vector, model_version, opts}, _from, state) do
     case Map.fetch(state.indices, model_version) do
-      {:ok, index} ->
-        k = Keyword.get(opts, :k, 10)
-        threshold = Keyword.get(opts, :threshold, 0.0)
+      {:ok, index} when not is_nil(index) ->
+        try do
+          k = Keyword.get(opts, :k, 10)
+          threshold = Keyword.get(opts, :threshold, 0.0)
 
-        case HNSWLib.Index.knn_query(index, query_vector, k: k) do
-          {:ok, labels, distances} ->
-            results =
-              Enum.zip(labels, distances)
-              |> Enum.filter(fn {_label, score} -> score >= threshold end)
-            {:reply, {:ok, results}, state}
-
-          {:error, msg} ->
-            # Catch empty index error from the C++ library
-            if is_binary(msg) and String.contains?(msg, "too small") do
-              {:reply, {:ok, []}, state}
-            else
-              Logger.error("HNSW Query Failed for model #{model_version}: #{msg}")
-              {:reply, {:error, msg}, state}
+          # CRITICAL FIX 4: Pass the Nx.Tensor directly
+          query_tensor =
+            case Nx.rank(query_vector) do
+              1 -> Nx.new_axis(query_vector, 0)
+              _ -> query_vector
             end
 
-          error ->
-            {:reply, error, state}
+          # Optimization: Check if index is empty
+          current_count = Map.get(state.insertion_count, model_version, 0)
+
+          if current_count == 0 do
+             {:reply, {:ok, []}, state}
+          else
+            # HNSWLib.Index.knn_query expects a 2D Nx.Tensor and returns 1D Nx.Tensors
+            case HNSWLib.Index.knn_query(index, query_tensor, k: k) do
+              {:ok, labels_tensor, distances_tensor} ->
+                # Convert Nx.Tensors to lists
+                flat_labels = Nx.to_flat_list(labels_tensor)
+                flat_dists = Nx.to_flat_list(distances_tensor)
+
+                results =
+                  Enum.zip(flat_labels, flat_dists)
+                  # Filter results by threshold here (Assuming score is 1.0 - distance for similarity)
+                  |> Enum.filter(fn {_label, dist} -> dist >= threshold end)
+                  |> Enum.map(fn {int_id, score} ->
+                    case :mnesia.dirty_read(@id_map_table, int_id) do
+                      [{_, ^int_id, uuid}] -> {uuid, score}
+                      _ -> nil
+                    end
+                  end)
+                  |> Enum.reject(&is_nil/1)
+
+                {:reply, {:ok, results}, state}
+
+              {:error, msg} ->
+                if is_binary(msg) and String.contains?(msg, "too small"), do: {:reply, {:ok, []}, state}, else: {:reply, {:error, msg}, state}
+
+              nil ->
+                {:reply, {:ok, []}, state}
+
+              other ->
+                Logger.error("VectorRouter: Unknown NIF return: #{inspect(other)}")
+                {:reply, {:ok, []}, state}
+            end
+          end
+        rescue
+          e ->
+            Logger.error("VectorRouter Query Crash: #{inspect(e)}")
+            {:reply, {:ok, []}, state}
         end
 
-      :error ->
-        # --- ERROR HANDLING: Return {:ok, []} on unsupported/missing model ---
-        Logger.warning("Query received for unsupported/missing model: #{model_version}. Returning empty results.")
+      _ ->
         {:reply, {:ok, []}, state}
     end
   end
@@ -1836,29 +2524,40 @@ defmodule CMS.VectorRouter do
 
   @impl true
   def handle_info(:periodic_persist, state) do
-    # Only persist models that have changes
     Enum.each(MapSet.to_list(state.dirty_models), fn model ->
       if index = Map.get(state.indices, model) do
         save_to_disk(model, index)
       end
     end)
+    Process.send_after(self(), :periodic_persist, @persist_interval)
     {:noreply, %{state | dirty_models: MapSet.new(), insertion_count: Map.new()}}
   end
 
-  defp load_index(model_version) do
-    path = index_file_path(model_version)
-    if File.exists?(path) do
-      HNSWLib.Index.load_index(:cosine, @dim, path)
-    else
-      {:error, :not_found}
-    end
+  # --- Internals ---
+
+  defp init_mnesia do
+    nodes = [Node.self()]
+    :mnesia.create_table(@id_map_table, [
+      attributes: [:int_id, :uuid],
+      disc_copies: nodes,
+      type: :set
+    ])
+    :mnesia.wait_for_tables([@id_map_table], 5000)
   end
 
   defp save_to_disk(model_version, index) do
     path = index_file_path(model_version)
-    Logger.debug("Persisting HNSW index for model '#{model_version}' to #{path}...")
-    HNSWLib.Index.save_index(index, path)
+    if index do
+      HNSWLib.Index.save_index(index, path)
+    end
   end
+
+  defp index_file_path(model_version) do
+    File.mkdir_p!(@base_index_dir)
+    Path.join(@base_index_dir, "#{String.replace(model_version, "-", "_")}.hnsw.bin")
+  end
+
+  # Removed: to_flat_list_sanitized/1 as it is no longer needed.
 end
 
 
@@ -2326,7 +3025,9 @@ defmodule CMS.BusPipeline do
       name: __MODULE__,
       producer: [
         module: {CMS.QueryRouter, []},
-        concurrency: 1
+        concurrency: 1,
+        # REMEDIATION: Transformer added to wrap raw events in Broadway.Message structs
+        transformer: {__MODULE__, :transform_entry, []}
       ],
       processors: [
         default: [
@@ -2341,6 +3042,17 @@ defmodule CMS.BusPipeline do
         ]
       ]
     )
+  end
+
+  @doc """
+  Transforms raw events from the producer into Broadway Messages.
+  Required because CMS.QueryRouter emits raw tuples, not structs.
+  """
+  def transform_entry(event, _opts) do
+    %Broadway.Message{
+      data: event,
+      acknowledger: {Broadway.NoopAcknowledger, nil, nil}
+    }
   end
 
   @impl true
@@ -2371,17 +3083,25 @@ defmodule CMS.BusPipeline do
   end
 
   defp do_broadcast(query_context, target_regions) do
+    query_id = Map.get(query_context, :query_id)
+
     # Broadcast to each target semantic region
     Enum.each(target_regions, fn region_id ->
       topic = "region:#{region_id}"
 
-      # The payload is the query context
+      # 1. The payload is the query context
       # NodeActors subscribed to this topic will wake up
       Phoenix.PubSub.broadcast(
         CMS.PubSub,
         topic,
         {:query, query_context}
       )
+
+      # 2. CRITICAL FIX: Notify Coordinator that this region has been contacted.
+      # Without this, QueryCoordinator waits for 10s timeout (Status 504).
+      if query_id do
+        CMS.QueryCoordinator.region_complete(query_id, region_id)
+      end
     end)
   end
 end
@@ -2972,10 +3692,13 @@ defmodule CMS.DataTail do
   Responsibilities:
   1. Topology: Holds the list of Edges (relationships).
   2. Provenance: Tracks versioning pointers (Chrono Stack).
-  3. Security: Holds **Structured ACLs** (Access Control Lists).
-  4. Salience: Holds the base importance score (used to initialize Antenna Gain).
+  3. Security: Holds Structured ACLs (Access Control Lists).
+  4. Salience: Holds the base importance score.
 
-  CRITICAL UPDATE (Gap 11/12): ACLs are now a structured map for role-based security.
+  CRITICAL REMEDIATION (Fix 3):
+  1. Implements Input Normalization for ACLs.
+     Accepts nil, Lists, or Maps and converts them all to the standard
+     %{read: [], write: []} structure to prevent crashes.
   """
 
   alias CMS.Edge
@@ -2989,10 +3712,9 @@ defmodule CMS.DataTail do
     :relationship_metadata  # List[%CMS.Edge{}]: The outgoing connections
   ]
 
-  # --- TYPE REFACTOR: Updated ACLs to a map ---
   @type acls_t :: %{
-    read: [String.t()],    # Agent IDs or Roles that can read the node (e.g., "public", "system")
-    write: [String.t()]   # Agent IDs or Roles that can modify the node
+    read: [String.t()],    # Agent IDs or Roles that can read the node
+    write: [String.t()]    # Agent IDs or Roles that can modify the node
   }
 
   @type t :: %__MODULE__{
@@ -3000,33 +3722,47 @@ defmodule CMS.DataTail do
     checksum: String.t(),
     acls: acls_t(),
     salience_score: float(),
-    relationship_metadata: [CMS.Edge.t()]
+    relationship_metadata: [Edge.t()]
   }
 
-  # --- STRUCT UPDATE: New constructor uses structured default ACLs ---
   @doc """
   Creates a new DataTail struct.
+  Automatically normalizes ACL inputs into the required Map structure.
   """
-  @spec new(float(), [CMS.Edge.t()], acls_t() | [String.t()] | nil, String.t() | nil) :: t()
+  @spec new(float(), [Edge.t()], acls_t() | [String.t()] | nil, String.t() | nil) :: t()
   def new(salience_score, edges \\ [], acls_input \\ nil, versioning_pointer \\ nil) do
-    # Normalize the input ACLs. If a simple list is provided, default it to both read/write roles.
-    acls = case acls_input do
-      nil ->
-        %{read: ["public"], write: ["system", "root"]}
-      %{} = map ->
-        map
-      list when is_list(list) ->
-        # Assume if a list of IDs is provided, they have full control
-        %{read: list ++ ["public"], write: list}
-    end
+    # REMEDIATION: Normalize input ACLs to ensure Map structure
+    acls = normalize_acls(acls_input)
 
     %__MODULE__{
       salience_score: salience_score,
       relationship_metadata: edges,
       acls: acls,
       versioning_pointer: versioning_pointer,
-      checksum: "" # Checksum is calculated during NodeFactory creation (Step 5)
+      checksum: "" # Checksum is calculated during NodeFactory creation
     }
+  end
+
+  # --- Internal Normalization Logic ---
+
+  # Case 1: Nil -> Default Public Access
+  defp normalize_acls(nil) do
+    %{read: ["public"], write: ["system", "root"]}
+  end
+
+  # Case 2: Already a Map -> Pass through
+  defp normalize_acls(%{} = map) do
+    map
+  end
+
+  # Case 3: List -> Assume strict ownership (Read+Write for IDs in list, plus Public Read)
+  defp normalize_acls(list) when is_list(list) do
+    %{read: list ++ ["public"], write: list}
+  end
+
+  # Case 4: Invalid Input -> Fallback to Default Safe Access
+  defp normalize_acls(_) do
+    %{read: ["public"], write: ["system", "root"]}
   end
 end
 

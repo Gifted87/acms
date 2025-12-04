@@ -5,10 +5,13 @@ defmodule CMS.DataTail do
   Responsibilities:
   1. Topology: Holds the list of Edges (relationships).
   2. Provenance: Tracks versioning pointers (Chrono Stack).
-  3. Security: Holds **Structured ACLs** (Access Control Lists).
-  4. Salience: Holds the base importance score (used to initialize Antenna Gain).
+  3. Security: Holds Structured ACLs (Access Control Lists).
+  4. Salience: Holds the base importance score.
 
-  CRITICAL UPDATE (Gap 11/12): ACLs are now a structured map for role-based security.
+  CRITICAL REMEDIATION (Fix 3):
+  1. Implements Input Normalization for ACLs.
+     Accepts nil, Lists, or Maps and converts them all to the standard
+     %{read: [], write: []} structure to prevent crashes.
   """
 
   alias CMS.Edge
@@ -22,10 +25,9 @@ defmodule CMS.DataTail do
     :relationship_metadata  # List[%CMS.Edge{}]: The outgoing connections
   ]
 
-  # --- TYPE REFACTOR: Updated ACLs to a map ---
   @type acls_t :: %{
-    read: [String.t()],    # Agent IDs or Roles that can read the node (e.g., "public", "system")
-    write: [String.t()]   # Agent IDs or Roles that can modify the node
+    read: [String.t()],    # Agent IDs or Roles that can read the node
+    write: [String.t()]    # Agent IDs or Roles that can modify the node
   }
 
   @type t :: %__MODULE__{
@@ -33,32 +35,46 @@ defmodule CMS.DataTail do
     checksum: String.t(),
     acls: acls_t(),
     salience_score: float(),
-    relationship_metadata: [CMS.Edge.t()]
+    relationship_metadata: [Edge.t()]
   }
 
-  # --- STRUCT UPDATE: New constructor uses structured default ACLs ---
   @doc """
   Creates a new DataTail struct.
+  Automatically normalizes ACL inputs into the required Map structure.
   """
-  @spec new(float(), [CMS.Edge.t()], acls_t() | [String.t()] | nil, String.t() | nil) :: t()
+  @spec new(float(), [Edge.t()], acls_t() | [String.t()] | nil, String.t() | nil) :: t()
   def new(salience_score, edges \\ [], acls_input \\ nil, versioning_pointer \\ nil) do
-    # Normalize the input ACLs. If a simple list is provided, default it to both read/write roles.
-    acls = case acls_input do
-      nil ->
-        %{read: ["public"], write: ["system", "root"]}
-      %{} = map ->
-        map
-      list when is_list(list) ->
-        # Assume if a list of IDs is provided, they have full control
-        %{read: list ++ ["public"], write: list}
-    end
+    # REMEDIATION: Normalize input ACLs to ensure Map structure
+    acls = normalize_acls(acls_input)
 
     %__MODULE__{
       salience_score: salience_score,
       relationship_metadata: edges,
       acls: acls,
       versioning_pointer: versioning_pointer,
-      checksum: "" # Checksum is calculated during NodeFactory creation (Step 5)
+      checksum: "" # Checksum is calculated during NodeFactory creation
     }
+  end
+
+  # --- Internal Normalization Logic ---
+
+  # Case 1: Nil -> Default Public Access
+  defp normalize_acls(nil) do
+    %{read: ["public"], write: ["system", "root"]}
+  end
+
+  # Case 2: Already a Map -> Pass through
+  defp normalize_acls(%{} = map) do
+    map
+  end
+
+  # Case 3: List -> Assume strict ownership (Read+Write for IDs in list, plus Public Read)
+  defp normalize_acls(list) when is_list(list) do
+    %{read: list ++ ["public"], write: list}
+  end
+
+  # Case 4: Invalid Input -> Fallback to Default Safe Access
+  defp normalize_acls(_) do
+    %{read: ["public"], write: ["system", "root"]}
   end
 end

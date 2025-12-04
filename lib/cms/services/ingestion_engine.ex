@@ -111,12 +111,14 @@ defmodule CMS.IngestionEngine do
     query_result = VectorRouter.query(
       embedding,
       model_version,
-      k: @max_associative_links
+      k: @max_associative_links,
+      threshold: @min_associative_score # Pass threshold to VectorRouter
     )
 
     case query_result do
       {:ok, candidates} ->
         edges = candidates
+        # Redundant filter in case VectorRouter ignores threshold
         |> Enum.filter(fn {_id, score} -> score >= @min_associative_score end)
         |> Enum.map(fn {target_id, score} ->
           # Use score as the initial weight for the semantic link
@@ -128,6 +130,8 @@ defmodule CMS.IngestionEngine do
       {:error, reason} ->
         Logger.warning("VectorRouter failed to prime edges: #{inspect(reason)}. Continuing with no initial links.")
         {:ok, []}
+
+      _ -> {:ok, []}
     end
   end
   # ------------------------------------------------------------------------
@@ -145,14 +149,17 @@ defmodule CMS.IngestionEngine do
     case query_result do
       {:ok, candidates} ->
         case candidates do
-          [{existing_id, _score} | _] ->
+          [{existing_id, score} | _] ->
             # High vector similarity found.
-            if new_node.id == existing_id do
-              # Exact duplicate content (ID matches). Idempotent.
-              :ok
+            # Double check score and ID
+            if score >= @conflict_similarity_threshold do
+              if new_node.id == existing_id do
+                :ok # Exact duplicate content (ID matches). Idempotent.
+              else
+                {:conflict, existing_id} # Different ID but almost identical meaning -> Potential Conflict.
+              end
             else
-              # Different ID but almost identical meaning -> Potential Conflict.
-              {:conflict, existing_id}
+              :ok # Score wasn't high enough (redundant safety)
             end
           _ ->
             :ok
@@ -161,6 +168,8 @@ defmodule CMS.IngestionEngine do
       {:error, _reason} ->
         # If the index is empty or fails, we assume no conflict exists.
         :ok
+
+       _ -> :ok
     end
   end
 
@@ -205,6 +214,7 @@ defmodule CMS.IngestionEngine do
         catch
           # If node crashes or times out during arbitration, default to neutral
           :exit, _ -> 0.5
+          _, _ -> 0.5
         end
     end
   end

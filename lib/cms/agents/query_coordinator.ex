@@ -2,7 +2,7 @@ defmodule CMS.QueryCoordinator do
   use GenServer
   require Logger
 
-  alias CMS.LogAppender # Added LogAppender alias for failure reporting
+  alias CMS.LogAppender
 
   @moduledoc """
   Orchestrates the lifecycle of a single query.
@@ -16,7 +16,7 @@ defmodule CMS.QueryCoordinator do
   # Configuration
   @top_k_results 50             # Only care about top 50 relevant nodes
   @inhibit_threshold_count 100  # If >100 nodes fire, trigger inhibition
-  @query_timeout 5_000          # Max time to wait for results
+  @query_timeout 10_000         # Max time to wait for results (Increased from 5s to 10s)
   @inhibit_check_delay 150      # Check for explosion 150ms after start
 
   # State
@@ -31,7 +31,6 @@ defmodule CMS.QueryCoordinator do
   ]
 
   # API
-  # ... (start_link, node_fired, region_complete remain unchanged)
 
   @doc """
   Starts a coordinator for a specific query.
@@ -148,7 +147,8 @@ defmodule CMS.QueryCoordinator do
     LogAppender.append_system_event(:query_failure, %{
       query_id: state.query_id,
       reason: reason,
-      origin_pid: state.origin_pid,
+      # REMEDIATION: inspect PID to ensure it can be encoded to JSON
+      origin_pid: inspect(state.origin_pid),
       fired_node_count: map_size(state.fired_nodes),
       active_regions: MapSet.to_list(state.active_regions)
     })

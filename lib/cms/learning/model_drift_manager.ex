@@ -50,14 +50,20 @@ defmodule CMS.ModelDriftManager do
     # Asynchronously ask the node for its header info
     Task.start(fn ->
       try do
-        node_head = GenServer.call(pid, :get_head_info, 5000)
-
-        if node_head.embedding_model_version != active_model do
-          # Trigger self-repair on the node
-          GenServer.cast(pid, {:re_embed_request, active_model})
+        # REMEDIATION: Defensive pattern matching to handle nil or invalid returns
+        # Previously crashed if call returned nil (KeyError)
+        case GenServer.call(pid, :get_head_info, 5000) do
+          %CMS.NodeHead{} = node_head ->
+            if node_head.embedding_model_version != active_model do
+              # Trigger self-repair on the node
+              GenServer.cast(pid, {:re_embed_request, active_model})
+            end
+          _ ->
+            :noop # Got nil or unexpected format (e.g., node starting up)
         end
       catch
         :exit, _ -> :noop # Node died
+        _, _ -> :noop # Timeout or other error
       end
     end)
   end

@@ -33,8 +33,8 @@ defmodule AcnCms.MixProject do
 
       # Numerical Elixir - PINNED to 0.6.4 for Elixir 1.14 compatibility
       {:nx, "0.5.3", override: true},
-      {:complex, "0.5.0", override: true},	
-	
+      {:complex, "0.5.0", override: true},
+
       # HNSW Vector Lib
       {:hnswlib, "~> 0.1.0"},
 
@@ -45,9 +45,11 @@ defmodule AcnCms.MixProject do
       {:telemetry, "~> 1.0"},
 
       # HTTP Client
-      {:req, "~> 0.4.0"}
+      {:req, "~> 0.4.0"},
+
+      {:plug_cowboy, "~> 2.6"}
+
     ]
 
   end
 end
-
