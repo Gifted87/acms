@@ -63,6 +63,8 @@ defmodule CMS.ActivationEngine do
   def handle_cast({:congestion_level, level}, state) do
     new_factor = calculate_inhibition(level)
     update_ets(new_factor)
+
+    Phoenix.PubSub.broadcast(CMS.PubSub, @congestion_topic, {:system_congestion, level})
     {:noreply, %{state | current_congestion: level}}
   end
 

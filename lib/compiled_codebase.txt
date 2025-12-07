@@ -96,7 +96,7 @@ defmodule CMS.Application do
       # 3. Persistence Layer
       CMS.EpochManager,
       CMS.LogAppender,
-      CMS.VectorRouter,
+      # REMOVED: CMS.VectorRouter (No longer needed in decentralized model)
 
       # 4. Learning & Regulation Layer
       CMS.ActivationEngine,
@@ -104,10 +104,9 @@ defmodule CMS.Application do
       CMS.ModelDriftManager,
       CMS.HebbianBufferSupervisor,
 
-      # 5. Pipeline & Ingestion
-      # REMOVED: CMS.QueryRouter (It is started by CMS.BusPipeline)
-      CMS.BusPipeline,
+      # 5. Ingestion & Query Services
       CMS.IngestionEngine,
+      CMS.BroadcastCoordinator,
 
       # 6. The Node Population
       CMS.NodeSupervisor,
@@ -297,7 +296,7 @@ defmodule CMS.IngestionEngine do
   use GenServer
   require Logger
 
-  alias CMS.{Node, VectorRouter, LogAppender, NodeSupervisor, Security, MetaNode, Edge}
+  alias CMS.{Node, LogAppender, NodeSupervisor, Security, MetaNode, Edge}
 
   @moduledoc """
   The Gatekeeper. Orchestrates the Zero-Friction Ingestion Protocol.
@@ -310,15 +309,19 @@ defmodule CMS.IngestionEngine do
   1. Validate incoming data payloads (FIDs).
   2. Enforce Security (ACLs).
   3. Generate Embeddings & Salience Scores.
-  4. Detect Conflicts via Vector Search & Trust Scores.
-  5. Finalize Persistence (Log, Index, Spawn).
+  4. Detect Conflicts via direct similarity calculation.
+  5. Finalize Persistence (Log, Spawn).
   """
 
   # Configuration
-  @max_associative_links 5       # Max number of non-conflict links to prime
-  @min_associative_score 0.60    # Min score to consider for a semantic link
-  @conflict_similarity_threshold 0.98
+  @max_associative_links 10       # Max number of non-conflict links to prime
+  @min_associative_score 0.3    # Threshold for Hebbian Priming
+  @conflict_similarity_threshold 0.8
   @trust_supersede_threshold 0.2 # If new node is > 0.2 more trusted, it wins.
+
+  # Scatter-Gather Configuration
+  @scatter_concurrency 100       # How many nodes to query in parallel
+  @scatter_timeout 5000          # Max time to wait for a node to respond
 
   def start_link(_opts) do
     GenServer.start_link(__MODULE__, :ok, name: __MODULE__)
@@ -357,12 +360,20 @@ defmodule CMS.IngestionEngine do
       # Calculate Salience (Hooked up from SalienceEngine)
       salience = CMS.SalienceEngine.calculate(req.fact_text, req.provenance || %{})
 
-      # *** IMPLEMENTATION: HEBBIAN PRIMING (Fix 1) ***
+      # *** IMPLEMENTATION: HEBBIAN PRIMING (SCATTER-GATHER) ***
       # Fetch initial associative links *before* creating the DataTail
       # This connects the new node to the existing knowledge graph immediately.
       {:ok, initial_edges} = prime_initial_edges(embedding, "all-MiniLM-L6-v2")
 
       data_tail = CMS.DataTail.new(salience, initial_edges, req.acls || ["public"])
+
+      # --- LOGGING: Inspect the DataTail to verify relationships ---
+      Logger.info("""
+      [Ingestion] Constructed DataTail for new fact: "#{String.slice(req.fact_text, 0, 50)}..."
+      Relationships: #{length(initial_edges)} found.
+      DataTail Dump: #{inspect(data_tail)}
+      """)
+      # -------------------------------------------------------------
 
       node_body = CMS.NodeBody.new(data_head, req.description_payloads, data_tail)
 
@@ -370,7 +381,7 @@ defmodule CMS.IngestionEngine do
       {:ok, new_node} = Node.new(node_head, node_body, req.provenance)
 
       # Step 3: Conflict Detection & Trust Arbitration (Fix 4)
-      # We check if a very similar node already exists
+      # We check if a very similar node already exists (optimized with Scatter-Gather)
       case check_for_conflict(new_node) do
         {:conflict, existing_id} ->
           # Trigger Trust-Based Arbitration
@@ -400,71 +411,148 @@ defmodule CMS.IngestionEngine do
     end)
   end
 
-  # --- FIX 1: Automated Association / Hebbian Priming Logic ---
-  defp prime_initial_edges(embedding, model_version) do
-    # Query VectorRouter for top N semantic neighbors
-    query_result = VectorRouter.query(
-      embedding,
-      model_version,
-      k: @max_associative_links,
-      threshold: @min_associative_score # Pass threshold to VectorRouter
-    )
+  # --- FIX 1: Automated Association / Hebbian Priming Logic (Scatter-Gather) ---
+  defp prime_initial_edges(embedding, _model_version) do
+    # 1. SCATTER: Get all PIDs and initiate parallel queries
+    all_node_pids = NodeSupervisor.get_all_active_node_pids()
 
-    case query_result do
-      {:ok, candidates} ->
-        edges = candidates
-        # Redundant filter in case VectorRouter ignores threshold
-        |> Enum.filter(fn {_id, score} -> score >= @min_associative_score end)
-        |> Enum.map(fn {target_id, score} ->
-          # Use score as the initial weight for the semantic link
-          Edge.new(target_id, :semantic, score)
-        end)
+    # Task.async_stream performs the Scatter-Gather
+    # It spawns a process for each PID to run the calculation function
+    similarities =
+      all_node_pids
+      |> Task.async_stream(fn pid ->
+        try do
+          # CRITICAL FIX: Use get_drift_info to get ID AND Embedding.
+          # :get_head_info was missing the ID, causing empty edges.
+          case GenServer.call(pid, :get_drift_info, @scatter_timeout) do
+            {node_id, remote_embedding, _ver, _reg} ->
+               if remote_embedding do
+                 score = cosine_similarity(embedding, remote_embedding)
 
-        {:ok, edges}
+                 # LOGGING: Relationship Calculation (Existing Node vs New Node)
+                 if score > 0.001 do
+                    Logger.debug("Calc: New Node vs #{node_id} = #{score}")
+                 end
 
-      {:error, reason} ->
-        Logger.warning("VectorRouter failed to prime edges: #{inspect(reason)}. Continuing with no initial links.")
-        {:ok, []}
+                 # Filter low relevance immediately to save memory
+                 if score >= @min_associative_score do
+                   {node_id, score}
+                 else
+                   nil
+                 end
+               else
+                 nil
+               end
+            _ -> nil
+          end
+        rescue
+          _ -> nil # Handle dead nodes or timeouts gracefully
+        end
+      end, max_concurrency: @scatter_concurrency, ordered: false) # GATHER: Collect results
 
-      _ -> {:ok, []}
-    end
+      # Process the stream results
+      |> Enum.reduce([], fn
+        {:ok, {node_id, score}}, acc -> [{node_id, score} | acc]
+        {:ok, nil}, acc -> acc
+        _, acc -> acc # Ignore crashes/exits
+      end)
+
+    # Sort by score descending and take top N
+    sorted_candidates = Enum.sort_by(similarities, fn {_, score} -> score end, &>=/2)
+
+    # --- LOGGING: Relationship Calculation Debug ---
+    Logger.info("""
+    [Hebbian Priming] Scanned #{length(all_node_pids)} nodes.
+    Candidates (score >= #{@min_associative_score}): #{length(sorted_candidates)}
+    Top Matches: #{inspect(Enum.take(sorted_candidates, 3))}
+    """)
+    # -----------------------------------------------
+
+    edges =
+      sorted_candidates
+      |> Enum.take(@max_associative_links)
+      |> Enum.map(fn {target_id, score} ->
+        # Use score as the initial weight for the semantic link
+        Edge.new(target_id, :semantic, score)
+      end)
+
+    {:ok, edges}
   end
   # ------------------------------------------------------------------------
 
 
   defp check_for_conflict(new_node) do
-    # Query VectorRouter for very high similarity neighbors
-    query_result = VectorRouter.query(
-      new_node.head.embedding,
-      new_node.head.embedding_model_version,
-      k: 1, # Top 1
-      threshold: @conflict_similarity_threshold # Only look for nearly identical matches
-    )
+    # 1. SCATTER: Get all PIDs
+    all_node_pids = NodeSupervisor.get_all_active_node_pids()
 
-    case query_result do
-      {:ok, candidates} ->
-        case candidates do
-          [{existing_id, score} | _] ->
-            # High vector similarity found.
-            # Double check score and ID
-            if score >= @conflict_similarity_threshold do
-              if new_node.id == existing_id do
-                :ok # Exact duplicate content (ID matches). Idempotent.
-              else
-                {:conflict, existing_id} # Different ID but almost identical meaning -> Potential Conflict.
-              end
-            else
-              :ok # Score wasn't high enough (redundant safety)
-            end
-          _ ->
-            :ok
+    # Task.async_stream for parallel conflict checks
+    conflicts =
+      all_node_pids
+      |> Task.async_stream(fn pid ->
+        try do
+          # CRITICAL FIX: Use get_drift_info to match inconsistent pattern
+          case GenServer.call(pid, :get_drift_info, @scatter_timeout) do
+             {node_id, remote_embedding, _ver, _reg} ->
+                score = cosine_similarity(new_node.head.embedding, remote_embedding)
+                if score >= @conflict_similarity_threshold do
+                  {node_id, score}
+                else
+                  nil
+                end
+             _ -> nil
+          end
+        rescue
+          _ -> nil
         end
+      end, max_concurrency: @scatter_concurrency, ordered: false)
 
-      {:error, _reason} ->
-        # If the index is empty or fails, we assume no conflict exists.
+      # GATHER: Find any conflicts
+      |> Enum.reduce([], fn
+        {:ok, {id, score}}, acc -> [{id, score} | acc]
+        {:ok, nil}, acc -> acc
+        _, acc -> acc
+      end)
+
+    case conflicts do
+      [{existing_id, _score} | _] ->
+        if new_node.id == existing_id do
+          :ok # Exact duplicate content (ID matches). Idempotent.
+        else
+          {:conflict, existing_id} # Different ID but almost identical meaning -> Potential Conflict.
+        end
+      _ ->
         :ok
+    end
+  end
 
-       _ -> :ok
+  # Helper function to calculate cosine similarity
+  # CRITICAL FIX: Correctly handle Nx.Tensor structs
+  defp cosine_similarity(vec_a, vec_b) do
+    try do
+      # Extract list data from Nx.Tensor structs if present
+      list_a = cond do
+        is_struct(vec_a, Nx.Tensor) -> Nx.to_flat_list(vec_a)
+        is_list(vec_a) -> vec_a
+        true -> []
+      end
+
+      list_b = cond do
+        is_struct(vec_b, Nx.Tensor) -> Nx.to_flat_list(vec_b)
+        is_list(vec_b) -> vec_b
+        true -> []
+      end
+
+      if list_a == [] or list_b == [] do
+        0.0
+      else
+        dot_product = Enum.zip(list_a, list_b) |> Enum.map(fn {a, b} -> a * b end) |> Enum.sum()
+        norm_a = :math.sqrt(Enum.map(list_a, &(&1 * &1)) |> Enum.sum())
+        norm_b = :math.sqrt(Enum.map(list_b, &(&1 * &1)) |> Enum.sum())
+
+        if norm_a == 0 or norm_b == 0, do: 0.0, else: dot_product / (norm_a * norm_b)
+      end
+    rescue
+      _ -> 0.0
     end
   end
 
@@ -485,8 +573,20 @@ defmodule CMS.IngestionEngine do
       trust_diff > @trust_supersede_threshold ->
         handle_supersedence(new_node, existing_id)
 
+        Phoenix.PubSub.broadcast(CMS.PubSub, "global:signals",
+          {:conflict_resolved, %{type: :superseded, winner: new_node.id, loser: existing_id}}
+        )
+
+        handle_supersedence(new_node, existing_id)
+
       # Case B: Trust is similar or Old node is trusted more -> DIALECTICAL MERGE
       true ->
+        handle_dialectical_merge(new_node, existing_id)
+
+        Phoenix.PubSub.broadcast(CMS.PubSub, "global:signals",
+          {:conflict_resolved, %{type: :dialectical_merge, node_a: new_node.id, node_b: existing_id}}
+        )
+
         handle_dialectical_merge(new_node, existing_id)
     end
   end
@@ -586,10 +686,7 @@ defmodule CMS.IngestionEngine do
     # 1. Persist to Epoch Log (Immutable History)
     LogAppender.append_node_event(node.id, :node_created, node)
 
-    # 2. Add to Vector Index (Searchable)
-    VectorRouter.add_embedding(node.id, node.head.embedding, node.head.embedding_model_version)
-
-    # 3. Spawn NodeActor (Active Memory)
+    # 2. Spawn NodeActor (Active Memory) - No vector index needed in decentralized model
     case NodeSupervisor.start_child(node) do
       {:ok, _pid} -> {:ok, node.id}
       {:error, {:already_started, _}} -> {:ok, node.id} # Idempotency
@@ -676,7 +773,7 @@ defmodule CMS.Web.Router do
   use Plug.Router
   require Logger
 
-  alias CMS.{IngestionEngine, QueryRouter, QueryCoordinator, TemporalQueryEngine, NodeSupervisor, VectorRouter}
+  alias CMS.{IngestionEngine, QueryCoordinator, TemporalQueryEngine, NodeSupervisor}
   alias CMS.{DataBodyPayload, FIDValidator, Tool.Embedder}
 
   plug Plug.Logger
@@ -688,6 +785,26 @@ defmodule CMS.Web.Router do
 
   plug :match
   plug :dispatch
+
+
+  defp format_public_response(score, node) do
+    %{
+      score: score,
+      node_id: node.id,
+      # 1. Extract Fact
+      fact: node.body.data_head.fact,
+      # 2. Extract Data Body (Payloads)
+      data: node.body.data_body,
+      # 3. Clean Metadata (No Embeddings/Internal State)
+      metadata: %{
+        created_at: node.created_at,
+        last_fired: node.last_fired,
+        checksum: node.body.data_tail.checksum,
+        # Handle the nil pointer for new nodes
+        version: node.body.data_tail.versioning_pointer || "v1 (genesis)"
+      }
+    }
+  end
 
   # ----------------------------------------------------------------------------
   # 1. INGESTION API
@@ -802,7 +919,7 @@ defmodule CMS.Web.Router do
     [CMS.SemanticRegion.compute_region_hash(vector, model)]
   end
 
-  # --- CRITICAL UPDATE: Implements Two-Phase Query with Global Fallback ---
+  # --- CRITICAL UPDATE: Implements Decentralized Query with Broadcast to All Nodes ---
   defp execute_live_query(conn, ctx) do
     query_id = UUID.uuid4()
 
@@ -819,135 +936,77 @@ defmodule CMS.Web.Router do
       system_mode: safe_atom_cast(ctx.params["system_mode"], :normal, [:normal, :emergency])
     }
 
-    # ----------------------------------------------------------------------
-    # PHASE 1: Targeted Search (Efficient)
-    # ----------------------------------------------------------------------
-    {:ok, coord_pid} = QueryCoordinator.start_link(query_id, ctx.target_regions, self())
+    # NEW: Start a coordinator to collect responses from nodes that fire
+    # Pass self() as the origin_pid so the coordinator knows where to send the ready signal and results
+    {:ok, coord_pid} = QueryCoordinator.start_link(query_id, [0], self())
     ref = Process.monitor(coord_pid)
 
-    # 1.a Inject VectorRouter Results (The "Guaranteed Match" path)
-    k = ctx.params["max_results"] || 50
-    min_rel = ctx.params["min_relevance"] || 0.6
+    # CRITICAL FIX: Wait for the coordinator to signal that it's ready/registered.
+    # This prevents the race condition where nodes fire and try to report results
+    # before the Coordinator is findable in the Registry.
+    receive do
+      {:coordinator_ready, ^query_id} ->
+        Logger.debug("WebRouter: Coordinator #{query_id} confirmed ready. Dispatching broadcast.")
+        # NEW: Broadcast query to ALL nodes using the decentralized coordinator
+        CMS.BroadcastCoordinator.broadcast_query(query_context)
 
-    case VectorRouter.query(ctx.query_vector, ctx.model, k: k) do
-        {:ok, candidates} ->
-            Enum.each(candidates, fn {node_id, score} ->
-                if score >= min_rel do
-                    node_data = fetch_active_or_historical_node(node_id)
-                    if node_data do
-                        # Direct injection bypasses NodeActor activation threshold
-                        QueryCoordinator.node_fired(query_id, node_id, score, node_data)
-                    end
-                end
-            end)
-        _ -> :ok
+      {:DOWN, ^ref, :process, _pid, _reason} ->
+        Logger.error("WebRouter: Coordinator crashed before ready signal.")
+        # We will fall through to the result receiver which will handle the DOWN message
+    after
+      2000 ->
+        Logger.error("WebRouter: Timed out waiting for Coordinator #{query_id} ready signal.")
     end
 
-    # 1.b Targeted Spreading Activation
-    QueryRouter.broadcast_query(query_context, ctx.target_regions)
-
-    # Wait for Phase 1 Results
-    phase_1_results =
+    # Wait for results with timeout
+    results =
       receive do
-        {:query_result, ^query_id, results} ->
+        {:query_result, ^query_id, received_results} ->
           Process.demonitor(ref, [:flush])
-          results
+          received_results
         {:DOWN, ^ref, :process, _pid, _reason} ->
           []
-      after 5000 -> # Short timeout for Phase 1
+      after 10000 -> # 10 second timeout for global broadcast
           Process.demonitor(ref, [:flush])
           []
-      end
-
-    # ----------------------------------------------------------------------
-    # PHASE 2: Global Fallback (Safety Net)
-    # If Phase 1 returned nothing, broadcast to ALL regions.
-    # ----------------------------------------------------------------------
-    final_results =
-      if phase_1_results == [] do
-        Logger.warning("Targeted Query #{query_id} returned 0 results. Triggering Global Broadcast Fallback.")
-
-        fallback_id = UUID.uuid4()
-        all_regions = Enum.to_list(0..255) # Broadcast to everyone
-
-        {:ok, fb_coord} = QueryCoordinator.start_link(fallback_id, all_regions, self())
-        fb_ref = Process.monitor(fb_coord)
-
-        # Update ID in context so nodes treat it as a new pulse
-        fallback_context = %{query_context | query_id: fallback_id}
-
-        QueryRouter.broadcast_query(fallback_context, all_regions)
-
-        receive do
-          {:query_result, ^fallback_id, fb_results} ->
-            Process.demonitor(fb_ref, [:flush])
-            fb_results
-          {:DOWN, ^fb_ref, :process, _, _} -> []
-        after 10000 -> # Longer timeout for global search
-            Process.demonitor(fb_ref, [:flush])
-            []
-        end
-      else
-        phase_1_results
       end
 
     # Response Construction
     limit = ctx.params["max_results"] || 50
 
-    # CRITICAL FIX: Transform tuples {score, node} to Maps %{score: s, node: n} for JSON encoding
+    # Transform tuples {score, node} to Maps %{score: s, node: n} for JSON encoding
     trimmed_results =
-      final_results
+      results
       |> Enum.take(limit)
-      |> Enum.map(fn {score, node} -> %{score: score, node: node} end)
+      |> Enum.map(fn {score, node} -> format_public_response(score, node) end)
 
     send_json(conn, 200, %{
-      query_id: query_id, # Note: if fallback used, this is still original ID reference
+      query_id: query_id,
       count: length(trimmed_results),
       results: trimmed_results,
-      fallback_triggered: (phase_1_results == [])
+      fallback_triggered: false # No fallback needed in new model
     })
   end
 
-  defp fetch_active_or_historical_node(node_id) do
-    if pid = NodeSupervisor.get_node_pid(node_id) do
-      try do
-        GenServer.call(pid, :get_state_snapshot, 1000)
-      rescue _ -> nil end
-    else
-      case TemporalQueryEngine.get_node_state_at_time(node_id, DateTime.utc_now()) do
-        {:ok, node} -> node
-        _ -> nil
-      end
-    end
-  end
+  # FIX: Underscored unused variables since this is a placeholder stub
+  defp execute_temporal_search(conn, _vector, _model, dt, _max_results, _min_relevance) do
+    # NOTE: Temporal search in the decentralized model is more complex and would require
+    # a different approach than the original VectorRouter-based method.
+    # For now, we return an informative message.
+    Logger.warning("Temporal search not fully implemented in decentralized model. Using fallback approach.")
 
-  defp execute_temporal_search(conn, vector, model, dt, max_results, min_relevance) do
-    # 1. Use Vector Router to find *current* candidates (Heuristic approach)
-    {:ok, candidates} = VectorRouter.query(vector, model, k: max_results * 2)
-
-    # 2. Reconstruct History for candidates
-    historical_results =
-      candidates
-      |> Enum.map(fn {id, score} ->
-        case TemporalQueryEngine.get_node_state_at_time(id, dt) do
-          {:ok, node} ->
-            # Inject the similarity score from the index for sorting
-            Map.put(node, "search_score", score)
-          _ -> nil # Node didn't exist at that time
-        end
-      end)
-      |> Enum.reject(&is_nil/1)
-      |> Enum.filter(fn node -> node["search_score"] >= min_relevance end)
-      |> Enum.sort_by(fn node -> node["search_score"] end, :desc)
-      |> Enum.take(max_results)
-
+    # For now, return an empty result with a warning
     send_json(conn, 200, %{
       query_type: "temporal",
       as_of: DateTime.to_iso8601(dt),
-      count: length(historical_results),
-      results: historical_results
+      count: 0,
+      results: [],
+      warning: "Temporal search not fully implemented in decentralized model yet"
     })
   end
+
+  # FIX: Deleted unused cosine_similarity/2
+  # FIX: Deleted unused fetch_active_or_historical_node/1
 
   # ----------------------------------------------------------------------------
   # 3. NODE MANAGEMENT API
@@ -1182,6 +1241,7 @@ defmodule CMS.Web.SocketHandler do
     Jason.encode!(%{event: "system_congestion", level: level, timestamp: DateTime.utc_now()})
   end
   defp serialize_event(other), do: Jason.encode!(%{event: "signal", data: inspect(other)})
+
 end
 
 
@@ -1203,14 +1263,16 @@ defmodule CMS.QueryCoordinator do
 
   Implements Gap 1: Global Inhibition / Winner-Takes-Most (WTM).
 
-  It collects results from responding NodeActors. If too many nodes fire ("Cognitive Overload"),
-  it broadcasts an :inhibit signal to prune the search tree.
+  It collects results from responding NodeActors.
+  Optimization: Implements a "Gathering Window" to finalize queries immediately
+  after results start arriving, avoiding fixed timeouts in broadcast mode.
   """
 
   # Configuration
   @top_k_results 50             # Only care about top 50 relevant nodes
   @inhibit_threshold_count 100  # If >100 nodes fire, trigger inhibition
-  @query_timeout 10_000         # Max time to wait for results (Increased from 5s to 10s)
+  @query_timeout 10_000         # Max time to wait if NO results arrive
+  @gathering_window 50          # NEW: Once first result arrives, wait only 50ms for others, then return.
   @inhibit_check_delay 150      # Check for explosion 150ms after start
 
   # State
@@ -1221,7 +1283,8 @@ defmodule CMS.QueryCoordinator do
     :fired_nodes,    # Map: %{node_id => {relevance, node_data}}
     :top_k_list,     # List: [{relevance, node_id}, ...] sorted desc
     :active_regions, # MapSet of regions pending completion
-    :inhibited?      # Boolean
+    :inhibited?,     # Boolean
+    :timeout_timer   # Reference to the active timeout timer
   ]
 
   # API
@@ -1238,8 +1301,11 @@ defmodule CMS.QueryCoordinator do
   """
   def node_fired(query_id, node_id, relevance, node_data) do
     case Registry.lookup(CMS.QueryCoordinatorRegistry, query_id) do
-      [{pid, _}] -> GenServer.cast(pid, {:node_fired, node_id, relevance, node_data})
-      [] -> :ok # Coordinator died or timed out, ignore
+      [{pid, _}] ->
+        GenServer.cast(pid, {:node_fired, node_id, relevance, node_data})
+      [] ->
+        Logger.warning("QueryCoordinator: Node #{node_id} attempted to fire for Query #{query_id}, but Coordinator not found.")
+        :ok
     end
   end
 
@@ -1257,11 +1323,18 @@ defmodule CMS.QueryCoordinator do
 
   @impl true
   def init({query_id, target_regions, origin_pid}) do
-    # Fail-safe timeout
-    Process.send_after(self(), :timeout, @query_timeout)
+    Logger.debug("Coordinator #{query_id}: Initializing...")
+
+    # Start the failsafe timeout (10s)
+    timer_ref = Process.send_after(self(), :timeout, @query_timeout)
 
     # Rapid inhibition check
     Process.send_after(self(), :check_inhibition, @inhibit_check_delay)
+
+    # CRITICAL FIX 1: Signal the caller (Web.Router) that the coordinator is ready.
+    # This prevents the race condition where nodes fire before the coordinator is findable.
+    send(origin_pid, {:coordinator_ready, query_id})
+    Logger.debug("Coordinator #{query_id}: Ready signal sent to #{inspect(origin_pid)}.")
 
     {:ok, %__MODULE__{
       query_id: query_id,
@@ -1270,26 +1343,55 @@ defmodule CMS.QueryCoordinator do
       active_regions: MapSet.new(target_regions),
       fired_nodes: %{},
       top_k_list: [],
-      inhibited?: false
+      inhibited?: false,
+      timeout_timer: timer_ref
     }}
   end
 
   @impl true
   def handle_cast({:node_fired, node_id, relevance, node_data}, state) do
-    # 1. Store Result
-    new_fired = Map.put(state.fired_nodes, node_id, {relevance, node_data})
+    # NEW LOGGING: Confirm receipt of fired node
+    Logger.debug("Coordinator #{state.query_id}: Received fired node #{node_id} (Score: #{:io_lib.format("~.4f", [relevance])})")
 
-    # 2. Update Top-K (Insertion Sort / limited list)
-    new_top_k = update_top_k(state.top_k_list, {relevance, node_id})
+    # CRITICAL FIX: Duplicate Prevention logic
+    # We check if we already have this node. If we do, we only update if the new score is higher.
+    should_update =
+      case Map.get(state.fired_nodes, node_id) do
+        {existing_score, _} when existing_score >= relevance -> false
+        _ -> true
+      end
 
-    # 3. Check Immediate Overload
-    if not state.inhibited? and map_size(new_fired) > @inhibit_threshold_count do
-      trigger_inhibition(state.query_id, state.active_regions)
-      # CRITICAL PATCH: Log overload failure
-      report_query_failure(state, :cognitive_overload)
-      {:noreply, %{state | fired_nodes: new_fired, top_k_list: new_top_k, inhibited?: true}}
+    if should_update do
+      # 1. Store Result
+      new_fired = Map.put(state.fired_nodes, node_id, {relevance, node_data})
+
+      # 2. Update Top-K (Insertion Sort / limited list / deduplication)
+      new_top_k = update_top_k(state.top_k_list, {relevance, node_id})
+
+      # 3. Latency Optimization (The Gathering Window)
+      new_timer =
+        if map_size(state.fired_nodes) == 0 do
+          Logger.debug("Coordinator #{state.query_id}: First result received. Switching to fast-path gathering window (#{@gathering_window}ms).")
+          Process.cancel_timer(state.timeout_timer)
+          Process.send_after(self(), :timeout, @gathering_window)
+        else
+          state.timeout_timer
+        end
+
+      new_state = %{state | fired_nodes: new_fired, top_k_list: new_top_k, timeout_timer: new_timer}
+
+      # 4. Check Immediate Overload
+      if not state.inhibited? and map_size(new_fired) > @inhibit_threshold_count do
+        Logger.warning("Coordinator #{state.query_id}: Threshold exceeded (#{map_size(new_fired)} nodes). Triggering inhibition.")
+        trigger_inhibition(state.query_id, state.active_regions)
+        report_query_failure(state, :cognitive_overload)
+        {:noreply, %{new_state | inhibited?: true}}
+      else
+        {:noreply, new_state}
+      end
     else
-      {:noreply, %{state | fired_nodes: new_fired, top_k_list: new_top_k}}
+      # Duplicate or lower score ignored
+      {:noreply, state}
     end
   end
 
@@ -1298,6 +1400,9 @@ defmodule CMS.QueryCoordinator do
     new_active = MapSet.delete(state.active_regions, region_id)
 
     if MapSet.size(new_active) == 0 do
+      Logger.debug("Coordinator #{state.query_id}: All regions complete. Finalizing.")
+      # Cancel any pending timers since we are finishing explicitly
+      Process.cancel_timer(state.timeout_timer)
       finalize_query(state)
       {:stop, :normal, state}
     else
@@ -1311,7 +1416,6 @@ defmodule CMS.QueryCoordinator do
     if not state.inhibited? and map_size(state.fired_nodes) > (@inhibit_threshold_count / 2) do
       Logger.debug("Coordinator #{state.query_id}: Fast inhibition triggered.")
       trigger_inhibition(state.query_id, state.active_regions)
-      # CRITICAL PATCH: Log fast overload warning
       report_query_failure(state, :rapid_inhibition)
       {:noreply, %{state | inhibited?: true}}
     else
@@ -1321,17 +1425,27 @@ defmodule CMS.QueryCoordinator do
 
   @impl true
   def handle_info(:timeout, state) do
-    # CRITICAL PATCH: Report explicit failure and finish with partial results
-    Logger.warning("Coordinator #{state.query_id} timed out.")
-    report_query_failure(state, :timeout)
-    finalize_query(state)
+    # This handler is now dual-purpose:
+    # 1. If 10s passed and NO results -> Report Timeout/Failure.
+    # 2. If 50ms passed and RESULTS exist -> Return Results (Fast Path).
+
+    result_count = map_size(state.fired_nodes)
+
+    if result_count > 0 do
+      Logger.info("Coordinator #{state.query_id}: Gathering window closed. Returning #{result_count} results.")
+      finalize_query(state)
+    else
+      Logger.warning("Coordinator #{state.query_id} timed out with 0 results.")
+      report_query_failure(state, :timeout)
+      finalize_query(state)
+    end
+
     {:stop, :normal, state}
   end
 
   # Internals
 
   defp trigger_inhibition(query_id, active_regions) do
-    # Broadcast :inhibit to all active regions via PubSub
     Enum.each(active_regions, fn region_id ->
       Phoenix.PubSub.broadcast(CMS.PubSub, "region:#{region_id}", {:inhibit, query_id})
     end)
@@ -1341,7 +1455,6 @@ defmodule CMS.QueryCoordinator do
     LogAppender.append_system_event(:query_failure, %{
       query_id: state.query_id,
       reason: reason,
-      # REMEDIATION: inspect PID to ensure it can be encoded to JSON
       origin_pid: inspect(state.origin_pid),
       fired_node_count: map_size(state.fired_nodes),
       active_regions: MapSet.to_list(state.active_regions)
@@ -1353,7 +1466,9 @@ defmodule CMS.QueryCoordinator do
     results =
       state.top_k_list
       |> Enum.map(fn {_score, id} -> Map.get(state.fired_nodes, id) end)
-      |> Enum.reject(&is_nil/1) # Safety check
+      |> Enum.reject(&is_nil/1)
+
+    Logger.info("Coordinator #{state.query_id}: Finalizing query with #{length(results)} top results.")
 
     # Send back to requestor
     send(state.origin_pid, {:query_result, state.query_id, results})
@@ -1362,6 +1477,7 @@ defmodule CMS.QueryCoordinator do
   defp update_top_k(list, new_entry) do
     [new_entry | list]
     |> Enum.sort_by(fn {score, _} -> score end, :desc)
+    |> Enum.uniq_by(fn {_, id} -> id end) # CRITICAL FIX: Deduplicate by ID
     |> Enum.take(@top_k_results)
   end
 
@@ -1534,19 +1650,21 @@ defmodule CMS.NodeActor do
   use GenServer
   require Logger
 
-  alias CMS.{Node, ActivationEngine, QueryCoordinator, RegionalHebbianBuffer, LogAppender, SemanticRegion, TemporalQueryEngine}
+  alias CMS.{Node, NodeHead, NodeBody, DataHead, DataTail, NodeAntenna, Edge}
+  alias CMS.{ActivationEngine, QueryCoordinator, RegionalHebbianBuffer, LogAppender, SemanticRegion, TemporalQueryEngine}
   alias CMS.Security
   alias CMS.Tool.Embedder
 
   @moduledoc """
   The Atomic Unit of Cognition (The "Neuron").
 
-  CRITICAL REMEDIATION (Fix 2 & Zombie Fix & Tuning):
+  CRITICAL REMEDIATION (Fix 2 & Zombie Fix & Tuning & Pulse Crash Fix):
   1. Implements Defensive Coding: Replaces strict map access with Map.get/3.
   2. Implements Safe Math: Guards Nx.dot operations.
   3. ZOMBIE FIX: Guards against starting with nil ID or Head.
   4. HYDRATION FIX: Ensures node terminates if it cannot find data.
   5. TUNING: Implements Synaptic Damping to cure "ADHD/Hub Dominance".
+  6. CRASH FIX: Fixed BadBooleanError in reinforce_link caused by strict 'and' on String IDs.
   """
 
   @abnormality_topic "global:abnormality_signal"
@@ -1586,17 +1704,15 @@ defmodule CMS.NodeActor do
   def handle_info(:hydrate, state) do
     case TemporalQueryEngine.get_node_state_at_time(state.node.id, DateTime.utc_now()) do
       {:ok, restored_node_map} ->
-        try do
-          restored_node = struct(CMS.Node, restored_node_map)
-
-          if is_nil(restored_node.head) do
-             raise "Restored node has no head"
-          end
-
-          {:noreply, %{state | node: restored_node, hydrated?: true}}
-        rescue
-          e ->
-            Logger.error("NodeActor #{state.node.id}: Hydration struct conversion failed: #{inspect(e)}")
+        # CRITICAL FIX: Custom deserialization from string-keyed map
+        case deserialize_node(restored_node_map) do
+          {:ok, restored_node} ->
+            if is_nil(restored_node.head) do
+               raise "Restored node has no head"
+            end
+            {:noreply, %{state | node: restored_node, hydrated?: true}}
+          {:error, reason} ->
+            Logger.error("NodeActor #{state.node.id}: Hydration deserialization failed: #{inspect(reason)}")
             retry_hydration(state)
         end
 
@@ -1619,14 +1735,11 @@ defmodule CMS.NodeActor do
 
   @impl true
   def handle_info({:query, context}, state) do
+    # Logger.debug("NodeActor #{state.node.id}: Received primary :query. Hydrated: #{state.hydrated?}")
     if state.hydrated? do
-      trace = Map.get(context, :trace, MapSet.new())
-
-      if MapSet.member?(trace, state.node.id) do
-        {:noreply, state}
-      else
-        process_activation(:primary, context, state, 0.0)
-      end
+      # NodeAntenna receives query and passes to NodeHead for autonomous evaluation
+      # This is the new decentralized approach: every node evaluates every query
+      autonomous_query_evaluation(context, state)
     else
       {:noreply, state}
     end
@@ -1643,11 +1756,18 @@ defmodule CMS.NodeActor do
     is_dead_pulse = (is_integer(ttl) and ttl <= 0)
 
     if is_dead_pulse or MapSet.member?(trace, state.node.id) do
+      # Logger.debug("NodeActor #{state.node.id}: Ignored pulse. Dead: #{is_dead_pulse}. Traced: #{MapSet.member?(trace, state.node.id)}")
       {:noreply, state}
     else
+      Logger.debug("NodeActor #{state.node.id}: Processing pulse from #{origin_id}. TTL: #{ttl}, Boost: #{boost}")
       reinforce_link(state.node, origin_id, state.region_id)
       process_activation(:secondary, context, state, boost, ttl)
     end
+  end
+
+  @impl true
+  def handle_info(_msg, state) do
+    {:noreply, state}
   end
 
   # --- GenServer Calls (handle_call) ---
@@ -1656,7 +1776,7 @@ defmodule CMS.NodeActor do
   def handle_call(:get_drift_info, _from, state) do
     if state.node.head do
       result = {state.node.id, state.node.head.embedding, state.node.head.embedding_model_version, state.region_id}
-      {:reply, {:ok, result}, state}
+      {:reply, result, state}
     else
       {:reply, {:error, :invalid_state}, state}
     end
@@ -1693,8 +1813,9 @@ defmodule CMS.NodeActor do
 
     new_edges = Enum.map(state.node.body.data_tail.relationship_metadata, fn edge ->
       hours_unused = DateTime.diff(now, edge.last_used_at, :hour)
-      if hours_unused > 24 do
-        %{edge | weight: max(0.01, edge.weight - (0.01 * (hours_unused / 24.0)))}
+      if hours_unused > 168 do
+        decay_amount = 0.001 * (hours_unused / 168.0)
+        %{edge | weight: max(0.01, edge.weight - decay_amount)}
       else
         edge
       end
@@ -1704,8 +1825,8 @@ defmodule CMS.NodeActor do
     frequency = state.node.antenna.activation_frequency
 
     new_internal_state = cond do
-      days_since_fired > 30 and frequency < 0.1 -> :hibernating
-      days_since_fired > 7 -> :low_energy
+      days_since_fired > 90 and frequency < 0.1 -> :hibernating
+      days_since_fired > 30 -> :low_energy
       frequency > 0.5 -> :high_energy
       true -> :recovering
     end
@@ -1788,6 +1909,89 @@ defmodule CMS.NodeActor do
 
   # --- Internal Logic ---
 
+  # CRITICAL PATCH: Function to fully deserialize a node map from log JSON
+  defp deserialize_node(node_map) do
+    try do
+      # 1. Deserialize nested structs (Bottom-Up)
+      head_map = Map.get(node_map, "head")
+      body_map = Map.get(node_map, "body")
+      antenna_map = Map.get(node_map, "antenna")
+
+      # Reconstruct DataTail and Edges
+      data_tail_map = Map.get(body_map, "data_tail")
+      relationship_metadata =
+        Enum.map(Map.get(data_tail_map, "relationship_metadata", []), fn edge_map ->
+          %Edge{
+            target_node_id: Map.get(edge_map, "target_node_id"),
+            type: String.to_atom(Map.get(edge_map, "type")),
+            weight: Map.get(edge_map, "weight"),
+            last_used_at: parse_dt!(Map.get(edge_map, "last_used_at"))
+          }
+        end)
+
+      data_tail = %DataTail{
+        acls: Map.get(data_tail_map, "acls"),
+        salience_score: Map.get(data_tail_map, "salience_score"),
+        relationship_metadata: relationship_metadata,
+        # Default other fields
+        versioning_pointer: Map.get(data_tail_map, "versioning_pointer"),
+        checksum: Map.get(data_tail_map, "checksum")
+      }
+
+      # Reconstruct DataBody (FIDs) and DataHead (Fact)
+      data_body_payloads = Map.get(body_map, "data_body", [])
+      # NOTE: For simplicity and assuming DataBodyPayloads are stable, we'll keep them as simple maps
+      # as the FIDValidator is only used at ingestion. If we needed to operate on them, full deserialization is needed here.
+
+      data_head = %DataHead{fact: Map.get(Map.get(body_map, "data_head"), "fact")}
+
+      # Reconstruct NodeBody
+      node_body = %NodeBody{
+        data_head: data_head,
+        data_body: data_body_payloads, # Keeping as maps
+        data_tail: data_tail
+      }
+
+      # Reconstruct NodeHead (CRITICAL: Embedding list -> Nx.Tensor)
+      node_head = %NodeHead{
+        embedding: Nx.tensor(Map.get(head_map, "embedding")),
+        embedding_model_version: Map.get(head_map, "embedding_model_version"),
+        relevance_threshold: Map.get(head_map, "relevance_threshold"),
+        internal_state: String.to_atom(Map.get(head_map, "internal_state"))
+      }
+
+      # Reconstruct NodeAntenna
+      node_antenna = %NodeAntenna{
+        gain: Map.get(antenna_map, "gain"),
+        activation_frequency: Map.get(antenna_map, "activation_frequency"),
+        signal_modulations: Map.get(antenna_map, "signal_modulations")
+      }
+
+      # 2. Reconstruct top-level Node
+      node = %Node{
+        id: Map.get(node_map, "id"),
+        head: node_head,
+        body: node_body,
+        antenna: node_antenna,
+        created_at: parse_dt!(Map.get(node_map, "created_at")),
+        last_fired: parse_dt!(Map.get(node_map, "last_fired"))
+      }
+
+      {:ok, node}
+    rescue
+      e ->
+        {:error, e}
+    end
+  end
+
+  defp parse_dt!(iso_str) when is_binary(iso_str) do
+    case DateTime.from_iso8601(iso_str) do
+      {:ok, dt, _} -> dt
+      _ -> raise "Invalid ISO8601 DateTime: #{inspect(iso_str)}"
+    end
+  end
+  defp parse_dt!(nil), do: raise "DateTime is nil"
+
   defp retry_hydration(state) do
     current_retry = state.hydration_retry_count
     next_retry = current_retry + 1
@@ -1816,7 +2020,7 @@ defmodule CMS.NodeActor do
     ]
   end
 
-  defp process_activation(type, context, state, boost, ttl \\ 0) do
+  defp process_activation(type, context, state, boost, ttl) do
     node = state.node
 
     cost = case node.head.internal_state do
@@ -1838,6 +2042,9 @@ defmodule CMS.NodeActor do
       agent_id = Map.get(context, :agent_id, "unknown")
 
       if Security.can_read?(agent_id, node.body.data_tail.acls) do
+        if type == :secondary do
+           Logger.info("NodeActor #{node.id} FIRED (Secondary) via Pulse. Score: #{:io_lib.format("~.4f", [total])} (Boost: #{boost})")
+        end
         fire_node(type, total, context, state, ttl)
       else
         {:noreply, state}
@@ -1864,9 +2071,7 @@ defmodule CMS.NodeActor do
     node = state.node
     new_node = %{node | last_fired: DateTime.utc_now(), head: %{node.head | internal_state: :high_energy}}
 
-    if type == :primary or score > 0.90 do
-       QueryCoordinator.node_fired(Map.get(context, :query_id), node.id, score, new_node)
-    end
+    QueryCoordinator.node_fired(Map.get(context, :query_id), node.id, score, new_node)
 
     base_ttl =
       cond do
@@ -1885,6 +2090,7 @@ defmodule CMS.NodeActor do
 
     if standard_out_ttl == :infinity or standard_out_ttl > 0 do
       new_trace = MapSet.put(Map.get(context, :trace, MapSet.new()), node.id)
+      Logger.debug("NodeActor #{node.id} propagating #{type} pulse to #{length(node.body.data_tail.relationship_metadata)} neighbors. Out TTL: #{standard_out_ttl}.")
 
       Enum.each(node.body.data_tail.relationship_metadata, fn edge ->
         if edge.weight > 0.1 do
@@ -1973,8 +2179,58 @@ defmodule CMS.NodeActor do
   end
 
   defp reinforce_link(node, target_id, region_id) do
-    if target_id and Enum.any?(node.body.data_tail.relationship_metadata, fn e -> e.target_node_id == target_id end) do
+    # CRITICAL FIX: Ensure target_id is not nil before checking boolean logic.
+    # 'and' requires booleans on both sides. Strings cause BadBooleanError.
+    if target_id != nil and Enum.any?(node.body.data_tail.relationship_metadata, fn e -> e.target_node_id == target_id end) do
       RegionalHebbianBuffer.buffer_update(node.id, [{target_id, 0.05}], region_id)
+    end
+  end
+
+  # Autonomous query evaluation: NodeHead independently decides if query is relevant
+  defp autonomous_query_evaluation(context, state) do
+    node = state.node
+
+    # Calculate relevance score between query and node's embedding
+    relevance = calculate_relevance(node, context)
+
+    # NodeHead applies its own relevance threshold
+    threshold = node.head.relevance_threshold
+
+    # Apply metabolic state cost factor
+    cost = case node.head.internal_state do
+      :high_energy -> 0.9
+      :low_energy -> 1.2
+      :hibernating -> 1.5
+      _ -> 1.0
+    end
+
+    # Apply global inhibition factor (spreading activation damping)
+    inhibit = ActivationEngine.get_global_inhibition_factor()
+    adjusted_threshold = (threshold / max(0.1, inhibit)) * cost
+
+    Logger.debug(
+      "NodeActor #{node.id}: Query [#{Map.get(context, :query_id)}]. " <>
+      "Relevance: #{:io_lib.format("~.4f", [relevance])}. " <>
+      "Threshold (Base: #{threshold}, Adj: #{:io_lib.format("~.4f", [adjusted_threshold])}). " <>
+      "Cost: #{cost}, Inhibit: #{inhibit}"
+    )
+
+    # Autonomous decision: Node fires if relevance meets threshold
+    if relevance >= adjusted_threshold do
+      agent_id = Map.get(context, :agent_id, "unknown")
+
+      if Security.can_read?(agent_id, node.body.data_tail.acls) do
+        Logger.info("NodeActor #{node.id} FIRED (Primary) for query [#{Map.get(context, :query_id)}]. Score: #{:io_lib.format("~.4f", [relevance])}")
+        # Node fires autonomously
+        fire_node(:primary, relevance, context, state, 0)
+      else
+        Logger.debug("NodeActor #{node.id} did not fire: Permission denied.")
+        {:noreply, state}
+      end
+    else
+      Logger.debug("NodeActor #{node.id} NO-OP: Relevance below adjusted threshold.")
+      # Node decides it's not relevant - no action taken
+      {:noreply, state}
     end
   end
 
@@ -2103,11 +2359,18 @@ defmodule CMS.RegionalHebbianBuffer do
         entries
         |> Enum.group_by(
           fn {{source, _target}, _delta} -> source end,
-          fn {{_source, target}, delta} -> {target, delta} end
+          fn {{_source, target}, delta} -> [target, delta] end
         )
 
       # 3. Send to LogAppender (Step 7)
       CMS.LogAppender.append_hebbian_updates(grouped_updates)
+      # --- NEW: Broadcast for Real-time Monitoring ---
+      # This proves Neuroplasticity is happening
+      total_updates = length(entries)
+      sample = List.first(grouped_updates)
+      Phoenix.PubSub.broadcast(CMS.PubSub, "global:signals",
+        {:hebbian_learning, %{update_count: total_updates, sample: sample}}
+      )
     end
   end
 
@@ -3108,6 +3371,47 @@ end
 
 
 ------------------------------------------------------------
+File: broadcast_coordinator.ex
+------------------------------------------------------------
+defmodule CMS.BroadcastCoordinator do
+  use GenServer
+  require Logger
+
+  @moduledoc """
+  Coordinates the broadcasting of queries to ALL nodes in the system.
+  
+  This coordinator implements the decentralized cognitive model where every node
+  receives every query and makes its own autonomous decision about relevance.
+  """
+
+  def start_link(opts \\ []) do
+    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+  end
+
+  @doc """
+  Broadcasts a query to all nodes in the system.
+  """
+  def broadcast_query(query_context) do
+    GenServer.cast(__MODULE__, {:broadcast_query, query_context})
+  end
+
+  def init(_opts) do
+    {:ok, %{}}
+  end
+
+  def handle_cast({:broadcast_query, query_context}, state) do
+    # Get all active node PIDs and broadcast the query to each one
+    all_pids = CMS.NodeSupervisor.get_all_active_node_pids()
+    
+    Enum.each(all_pids, fn pid ->
+      send(pid, {:query, query_context})
+    end)
+    
+    {:noreply, state}
+  end
+end
+
+------------------------------------------------------------
 File: query_router.ex
 ------------------------------------------------------------
 defmodule CMS.QueryRouter do
@@ -3663,17 +3967,20 @@ defmodule CMS.Node do
 
   @spec new(CMS.NodeHead.t(), CMS.NodeBody.t(), map()) :: {:ok, t()} | {:error, any()}
   def new(head, body, provenance_metadata) do
-    # Gap 14: Derive ID from content.
+    # 1. Generate the ID (Content Addressable Hash)
     node_id = CMS.NodeFactory.derive_content_addressable_id(body, provenance_metadata)
 
-    # Use the salience score directly to create the antenna
-    # (Removed unused initial_gain variable)
-    antenna = CMS.NodeAntenna.new(body.data_tail.salience_score)
+    # 2. WRITE BACK: The ID is the checksum. Update the DataTail.
+    updated_tail = %{body.data_tail | checksum: node_id}
+    updated_body = %{body | data_tail: updated_tail}
+
+    # 3. Create Antenna
+    antenna = CMS.NodeAntenna.new(updated_tail.salience_score)
 
     {:ok, %__MODULE__{
       id: node_id,
       head: head,
-      body: body,
+      body: updated_body, # Use the updated body containing the checksum
       antenna: antenna,
       created_at: DateTime.utc_now(),
       last_fired: DateTime.utc_now()
@@ -3876,7 +4183,7 @@ defmodule CMS.NodeHead do
   Creates a new NodeHead with default metabolic energy.
   """
   @spec new(Nx.Tensor.t(), String.t(), float()) :: t()
-  def new(embedding, model_version, threshold \\ 0.85) do
+  def new(embedding, model_version, threshold \\ 0.35) do
     %__MODULE__{
       embedding: embedding,
       embedding_model_version: model_version,
@@ -3949,6 +4256,225 @@ defmodule CMS.Tool.Embedder do
   defp process_response(invalid_body) do
     Logger.error("Embedder received invalid response format: #{inspect(invalid_body)}")
     {:error, :invalid_response_format}
+  end
+end
+
+
+------------------------------------------------------------
+File: New Text Document.txt
+------------------------------------------------------------
+defmodule CMS.Tools.LiveMonitor do
+  use GenServer
+  require Logger
+
+  @moduledoc """
+  A Matrix-style real-time console visualizer for the CMS.
+  
+  Run this in IEx to watch the brain think:
+  iex> CMS.Tools.LiveMonitor.start()
+  """
+
+  # ANSI Colors
+  @reset "\u001b[0m"
+  @green "\u001b[32m"      # Creation / Success
+  @blue "\u001b[34m"       # Query / Activation
+  @magenta "\u001b[35m"    # Neuroplasticity / Learning
+  @yellow "\u001b[33m"     # Warning / Conflict
+  @red "\u001b[31m"        # Decay / Destruction
+  @cyan "\u001b[36m"       # System / Pulse
+
+  def start do
+    GenServer.start_link(__MODULE__, :ok, name: __MODULE__)
+    IO.puts("\n#{@green}>>> NEURAL MONITOR ACTIVE. LISTENING TO COGNITIVE BUS... <<<#{@reset}\n")
+  end
+
+  def init(:ok) do
+    # Subscribe to the entire brain
+    Phoenix.PubSub.subscribe(CMS.PubSub, "global:signals")
+    Phoenix.PubSub.subscribe(CMS.PubSub, "global:abnormality_signal")
+    Phoenix.PubSub.subscribe(CMS.PubSub, "system_congestion")
+    
+    # We also want to snoop on query traffic. 
+    # Since regions are dynamic, we just listen to global signals, 
+    # but strictly speaking, QueryCoordinator fires results to specific PIDs.
+    # To monitor queries, we rely on the modifications made in Step 1/2 or existing broadcasts.
+    {:ok, %{}}
+  end
+
+  # -------------------------------------------------------------------
+  # 1. NEUROPLASTICITY (Hebbian Learning)
+  # -------------------------------------------------------------------
+  def handle_info({:hebbian_learning, data}, state) do
+    {source, updates} = data.sample
+    target_count = length(updates)
+    
+    IO.puts """
+    #{@magenta}[NEUROPLASTICITY]#{@reset} Batch Processed: #{data.update_count} weight adjustments.
+    Example: Node #{short_id(source)} strengthened links to #{target_count} neighbors.
+    """
+    {:noreply, state}
+  end
+
+  # -------------------------------------------------------------------
+  # 2. CONFLICT RESOLUTION (Dialectics)
+  # -------------------------------------------------------------------
+  def handle_info({:conflict_resolved, data}, state) do
+    msg = case data.type do
+      :superseded -> "Node #{short_id(data.winner)} SUPERSEDED #{short_id(data.loser)} (Trust Dominance)."
+      :dialectical_merge -> "Dialectical Merge initiated between #{short_id(data.node_a)} and #{short_id(data.node_b)}."
+    end
+
+    IO.puts """
+    #{@yellow}[CONFLICT ARBITRATION] #{msg}#{@reset}
+    """
+    {:noreply, state}
+  end
+
+  # -------------------------------------------------------------------
+  # 3. SPREADING ACTIVATION (Pulses)
+  # -------------------------------------------------------------------
+  # Note: To see pulses, we must subscribe to specific nodes. 
+  # This handler catches the 'abnormality' signals which are high-level pulse events.
+  def handle_info({:abnormality_signal, opts}, state) do
+    IO.puts """
+    #{@cyan}[HIGH ENERGY ACTIVATION]#{@reset} Node #{short_id(opts[:node_id])} 
+    Reason: #{opts[:reason]} | Query ID: #{short_id(opts[:query_id])}
+    """
+    {:noreply, state}
+  end
+
+  # -------------------------------------------------------------------
+  # 4. SYSTEM CONGESTION (Inhibition)
+  # -------------------------------------------------------------------
+  def handle_info({:system_congestion, level}, state) do
+    color = if level > 0.5, do: @red, else: @blue
+    IO.puts """
+    #{color}[SYSTEM HOMEOSTASIS] Congestion Level: #{level}. Inhibition Factor modulated.
+    """
+    {:noreply, state}
+  end
+
+  # -------------------------------------------------------------------
+  # 5. CATCH-ALL (Debugging)
+  # -------------------------------------------------------------------
+  def handle_info(msg, state) do
+    # Uncomment to see EVERYTHING (noisy)
+    # IO.inspect(msg, label: "RAW SIGNAL")
+    {:noreply, state}
+  end
+
+  defp short_id(nil), do: "???"
+  defp short_id(id) do 
+    if String.length(id) > 8, do: String.slice(id, 0, 8), else: id
+  end
+end
+
+------------------------------------------------------------
+File: live_monitor.ex
+------------------------------------------------------------
+defmodule CMS.Tools.LiveMonitor do
+  use GenServer
+  require Logger
+
+  @moduledoc """
+  A Matrix-style real-time console visualizer for the CMS.
+
+  Run this in IEx to watch the brain think:
+  iex> CMS.Tools.LiveMonitor.start()
+  """
+
+  # ANSI Colors
+  @reset "\u001b[0m"
+  @green "\u001b[32m"      # Creation / Success
+  @blue "\u001b[34m"       # Query / Activation
+  @magenta "\u001b[35m"    # Neuroplasticity / Learning
+  @yellow "\u001b[33m"     # Warning / Conflict
+  @red "\u001b[31m"        # Decay / Destruction
+  @cyan "\u001b[36m"       # System / Pulse
+
+  def start do
+    GenServer.start_link(__MODULE__, :ok, name: __MODULE__)
+    IO.puts("\n#{@green}>>> NEURAL MONITOR ACTIVE. LISTENING TO COGNITIVE BUS... <<<#{@reset}\n")
+  end
+
+  def init(:ok) do
+    # Subscribe to the entire brain
+    Phoenix.PubSub.subscribe(CMS.PubSub, "global:signals")
+    Phoenix.PubSub.subscribe(CMS.PubSub, "global:abnormality_signal")
+    Phoenix.PubSub.subscribe(CMS.PubSub, "system_congestion")
+
+    # We also want to snoop on query traffic.
+    # Since regions are dynamic, we just listen to global signals,
+    # but strictly speaking, QueryCoordinator fires results to specific PIDs.
+    # To monitor queries, we rely on the modifications made in Step 1/2 or existing broadcasts.
+    {:ok, %{}}
+  end
+
+  # -------------------------------------------------------------------
+  # 1. NEUROPLASTICITY (Hebbian Learning)
+  # -------------------------------------------------------------------
+  def handle_info({:hebbian_learning, data}, state) do
+    {source, updates} = data.sample
+    target_count = length(updates)
+
+    IO.puts """
+    #{@magenta}[NEUROPLASTICITY]#{@reset} Batch Processed: #{data.update_count} weight adjustments.
+    Example: Node #{short_id(source)} strengthened links to #{target_count} neighbors.
+    """
+    {:noreply, state}
+  end
+
+  # -------------------------------------------------------------------
+  # 2. CONFLICT RESOLUTION (Dialectics)
+  # -------------------------------------------------------------------
+  def handle_info({:conflict_resolved, data}, state) do
+    msg = case data.type do
+      :superseded -> "Node #{short_id(data.winner)} SUPERSEDED #{short_id(data.loser)} (Trust Dominance)."
+      :dialectical_merge -> "Dialectical Merge initiated between #{short_id(data.node_a)} and #{short_id(data.node_b)}."
+    end
+
+    IO.puts """
+    #{@yellow}[CONFLICT ARBITRATION] #{msg}#{@reset}
+    """
+    {:noreply, state}
+  end
+
+  # -------------------------------------------------------------------
+  # 3. SPREADING ACTIVATION (Pulses)
+  # -------------------------------------------------------------------
+  # Note: To see pulses, we must subscribe to specific nodes.
+  # This handler catches the 'abnormality' signals which are high-level pulse events.
+  def handle_info({:abnormality_signal, opts}, state) do
+    IO.puts """
+    #{@cyan}[HIGH ENERGY ACTIVATION]#{@reset} Node #{short_id(opts[:node_id])}
+    Reason: #{opts[:reason]} | Query ID: #{short_id(opts[:query_id])}
+    """
+    {:noreply, state}
+  end
+
+  # -------------------------------------------------------------------
+  # 4. SYSTEM CONGESTION (Inhibition)
+  # -------------------------------------------------------------------
+  def handle_info({:system_congestion, level}, state) do
+    color = if level > 0.5, do: @red, else: @blue
+    IO.puts """
+    #{color}[SYSTEM HOMEOSTASIS] Congestion Level: #{level}. Inhibition Factor modulated.
+    """
+    {:noreply, state}
+  end
+
+  # -------------------------------------------------------------------
+  # 5. CATCH-ALL (Debugging)
+  # -------------------------------------------------------------------
+  def handle_info(_msg, state) do
+    # Uncomment to see EVERYTHING (noisy)
+    # IO.inspect(msg, label: "RAW SIGNAL")
+    {:noreply, state}
+  end
+
+  defp short_id(nil), do: "???"
+  defp short_id(id) do
+    if String.length(id) > 8, do: String.slice(id, 0, 8), else: id
   end
 end
 

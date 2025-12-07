@@ -81,6 +81,26 @@ defmodule CMS.Web.Router do
   plug :match
   plug :dispatch
 
+
+  defp format_public_response(score, node) do
+    %{
+      score: score,
+      node_id: node.id,
+      # 1. Extract Fact
+      fact: node.body.data_head.fact,
+      # 2. Extract Data Body (Payloads)
+      data: node.body.data_body,
+      # 3. Clean Metadata (No Embeddings/Internal State)
+      metadata: %{
+        created_at: node.created_at,
+        last_fired: node.last_fired,
+        checksum: node.body.data_tail.checksum,
+        # Handle the nil pointer for new nodes
+        version: node.body.data_tail.versioning_pointer || "v1 (genesis)"
+      }
+    }
+  end
+
   # ----------------------------------------------------------------------------
   # 1. INGESTION API
   # ----------------------------------------------------------------------------
@@ -194,7 +214,7 @@ defmodule CMS.Web.Router do
     [CMS.SemanticRegion.compute_region_hash(vector, model)]
   end
 
-  # --- CRITICAL UPDATE: Implements Decentralized Query with Broadcast to All Nodes ---  
+  # --- CRITICAL UPDATE: Implements Decentralized Query with Broadcast to All Nodes ---
   defp execute_live_query(conn, ctx) do
     query_id = UUID.uuid4()
 
@@ -212,14 +232,29 @@ defmodule CMS.Web.Router do
     }
 
     # NEW: Start a coordinator to collect responses from nodes that fire
-    {:ok, coord_pid} = QueryCoordinator.start_link(query_id, [0], self()) # Single dummy region for tracking
+    # Pass self() as the origin_pid so the coordinator knows where to send the ready signal and results
+    {:ok, coord_pid} = QueryCoordinator.start_link(query_id, [0], self())
     ref = Process.monitor(coord_pid)
 
-    # NEW: Broadcast query to ALL nodes using the decentralized coordinator
-    CMS.BroadcastCoordinator.broadcast_query(query_context)
+    # CRITICAL FIX: Wait for the coordinator to signal that it's ready/registered.
+    # This prevents the race condition where nodes fire and try to report results
+    # before the Coordinator is findable in the Registry.
+    receive do
+      {:coordinator_ready, ^query_id} ->
+        Logger.debug("WebRouter: Coordinator #{query_id} confirmed ready. Dispatching broadcast.")
+        # NEW: Broadcast query to ALL nodes using the decentralized coordinator
+        CMS.BroadcastCoordinator.broadcast_query(query_context)
+
+      {:DOWN, ^ref, :process, _pid, _reason} ->
+        Logger.error("WebRouter: Coordinator crashed before ready signal.")
+        # We will fall through to the result receiver which will handle the DOWN message
+    after
+      2000 ->
+        Logger.error("WebRouter: Timed out waiting for Coordinator #{query_id} ready signal.")
+    end
 
     # Wait for results with timeout
-    results = 
+    results =
       receive do
         {:query_result, ^query_id, received_results} ->
           Process.demonitor(ref, [:flush])
@@ -238,7 +273,7 @@ defmodule CMS.Web.Router do
     trimmed_results =
       results
       |> Enum.take(limit)
-      |> Enum.map(fn {score, node} -> %{score: score, node: node} end)
+      |> Enum.map(fn {score, node} -> format_public_response(score, node) end)
 
     send_json(conn, 200, %{
       query_id: query_id,
@@ -248,25 +283,13 @@ defmodule CMS.Web.Router do
     })
   end
 
-  defp fetch_active_or_historical_node(node_id) do
-    if pid = NodeSupervisor.get_node_pid(node_id) do
-      try do
-        GenServer.call(pid, :get_state_snapshot, 1000)
-      rescue _ -> nil end
-    else
-      case TemporalQueryEngine.get_node_state_at_time(node_id, DateTime.utc_now()) do
-        {:ok, node} -> node
-        _ -> nil
-      end
-    end
-  end
-
-  defp execute_temporal_search(conn, vector, model, dt, max_results, min_relevance) do
+  # FIX: Underscored unused variables since this is a placeholder stub
+  defp execute_temporal_search(conn, _vector, _model, dt, _max_results, _min_relevance) do
     # NOTE: Temporal search in the decentralized model is more complex and would require
-    # a different approach than the original VectorRouter-based method. 
+    # a different approach than the original VectorRouter-based method.
     # For now, we return an informative message.
     Logger.warning("Temporal search not fully implemented in decentralized model. Using fallback approach.")
-    
+
     # For now, return an empty result with a warning
     send_json(conn, 200, %{
       query_type: "temporal",
@@ -277,22 +300,8 @@ defmodule CMS.Web.Router do
     })
   end
 
-  # Helper function to calculate cosine similarity
-  defp cosine_similarity(vec_a, vec_b) do
-    try do
-      # Convert to lists if they're tensors
-      list_a = if is_tuple(vec_a), do: Nx.to_flat_list(vec_a), else: vec_a
-      list_b = if is_tuple(vec_b), do: Nx.to_flat_list(vec_b), else: vec_b
-      
-      dot_product = Enum.zip(list_a, list_b) |> Enum.map(fn {a, b} -> a * b end) |> Enum.sum()
-      norm_a = :math.sqrt(Enum.map(list_a, &(&1 * &1)) |> Enum.sum())
-      norm_b = :math.sqrt(Enum.map(list_b, &(&1 * &1)) |> Enum.sum())
-      
-      if norm_a == 0 or norm_b == 0, do: 0, else: dot_product / (norm_a * norm_b)
-    rescue
-      _ -> 0.0
-    end
-  end
+  # FIX: Deleted unused cosine_similarity/2
+  # FIX: Deleted unused fetch_active_or_historical_node/1
 
   # ----------------------------------------------------------------------------
   # 3. NODE MANAGEMENT API
@@ -527,4 +536,5 @@ defmodule CMS.Web.SocketHandler do
     Jason.encode!(%{event: "system_congestion", level: level, timestamp: DateTime.utc_now()})
   end
   defp serialize_event(other), do: Jason.encode!(%{event: "signal", data: inspect(other)})
+
 end

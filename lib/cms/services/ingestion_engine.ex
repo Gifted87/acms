@@ -20,10 +20,14 @@ defmodule CMS.IngestionEngine do
   """
 
   # Configuration
-  @max_associative_links 5       # Max number of non-conflict links to prime
-  @min_associative_score 0.60    # Min score to consider for a semantic link
-  @conflict_similarity_threshold 0.98
+  @max_associative_links 10       # Max number of non-conflict links to prime
+  @min_associative_score 0.3    # Threshold for Hebbian Priming
+  @conflict_similarity_threshold 0.8
   @trust_supersede_threshold 0.2 # If new node is > 0.2 more trusted, it wins.
+
+  # Scatter-Gather Configuration
+  @scatter_concurrency 100       # How many nodes to query in parallel
+  @scatter_timeout 5000          # Max time to wait for a node to respond
 
   def start_link(_opts) do
     GenServer.start_link(__MODULE__, :ok, name: __MODULE__)
@@ -62,12 +66,20 @@ defmodule CMS.IngestionEngine do
       # Calculate Salience (Hooked up from SalienceEngine)
       salience = CMS.SalienceEngine.calculate(req.fact_text, req.provenance || %{})
 
-      # *** IMPLEMENTATION: HEBBIAN PRIMING (Fix 1) ***
+      # *** IMPLEMENTATION: HEBBIAN PRIMING (SCATTER-GATHER) ***
       # Fetch initial associative links *before* creating the DataTail
       # This connects the new node to the existing knowledge graph immediately.
       {:ok, initial_edges} = prime_initial_edges(embedding, "all-MiniLM-L6-v2")
 
       data_tail = CMS.DataTail.new(salience, initial_edges, req.acls || ["public"])
+
+      # --- LOGGING: Inspect the DataTail to verify relationships ---
+      Logger.info("""
+      [Ingestion] Constructed DataTail for new fact: "#{String.slice(req.fact_text, 0, 50)}..."
+      Relationships: #{length(initial_edges)} found.
+      DataTail Dump: #{inspect(data_tail)}
+      """)
+      # -------------------------------------------------------------
 
       node_body = CMS.NodeBody.new(data_head, req.description_payloads, data_tail)
 
@@ -75,7 +87,7 @@ defmodule CMS.IngestionEngine do
       {:ok, new_node} = Node.new(node_head, node_body, req.provenance)
 
       # Step 3: Conflict Detection & Trust Arbitration (Fix 4)
-      # We check if a very similar node already exists
+      # We check if a very similar node already exists (optimized with Scatter-Gather)
       case check_for_conflict(new_node) do
         {:conflict, existing_id} ->
           # Trigger Trust-Based Arbitration
@@ -105,42 +117,69 @@ defmodule CMS.IngestionEngine do
     end)
   end
 
-  # --- FIX 1: Automated Association / Hebbian Priming Logic ---
+  # --- FIX 1: Automated Association / Hebbian Priming Logic (Scatter-Gather) ---
   defp prime_initial_edges(embedding, _model_version) do
-    # In the decentralized model, we find similar nodes by calculating similarity
-    # against all active nodes in the system
+    # 1. SCATTER: Get all PIDs and initiate parallel queries
     all_node_pids = NodeSupervisor.get_all_active_node_pids()
-    
-    # Calculate similarity with all active nodes
-    similarities = 
+
+    # Task.async_stream performs the Scatter-Gather
+    # It spawns a process for each PID to run the calculation function
+    similarities =
       all_node_pids
-      |> Enum.map(fn pid ->
+      |> Task.async_stream(fn pid ->
         try do
-          node_state = GenServer.call(pid, :get_head_info, 5000)
-          if node_state && node_state.embedding do
-            score = cosine_similarity(embedding, node_state.embedding)
-            if score >= @min_associative_score do
-              {node_state, score}
-            else
-              nil
-            end
-          else
-            nil
+          # CRITICAL FIX: Use get_drift_info to get ID AND Embedding.
+          # :get_head_info was missing the ID, causing empty edges.
+          case GenServer.call(pid, :get_drift_info, @scatter_timeout) do
+            {node_id, remote_embedding, _ver, _reg} ->
+               if remote_embedding do
+                 score = cosine_similarity(embedding, remote_embedding)
+
+                 # LOGGING: Relationship Calculation (Existing Node vs New Node)
+                 if score > 0.001 do
+                    Logger.debug("Calc: New Node vs #{node_id} = #{score}")
+                 end
+
+                 # Filter low relevance immediately to save memory
+                 if score >= @min_associative_score do
+                   {node_id, score}
+                 else
+                   nil
+                 end
+               else
+                 nil
+               end
+            _ -> nil
           end
         rescue
-          _ -> nil
+          _ -> nil # Handle dead nodes or timeouts gracefully
         end
+      end, max_concurrency: @scatter_concurrency, ordered: false) # GATHER: Collect results
+
+      # Process the stream results
+      |> Enum.reduce([], fn
+        {:ok, {node_id, score}}, acc -> [{node_id, score} | acc]
+        {:ok, nil}, acc -> acc
+        _, acc -> acc # Ignore crashes/exits
       end)
-      |> Enum.reject(&is_nil/1)
-      |> Enum.sort_by(fn {_, score} -> score end, &>=/2)
+
+    # Sort by score descending and take top N
+    sorted_candidates = Enum.sort_by(similarities, fn {_, score} -> score end, &>=/2)
+
+    # --- LOGGING: Relationship Calculation Debug ---
+    Logger.info("""
+    [Hebbian Priming] Scanned #{length(all_node_pids)} nodes.
+    Candidates (score >= #{@min_associative_score}): #{length(sorted_candidates)}
+    Top Matches: #{inspect(Enum.take(sorted_candidates, 3))}
+    """)
+    # -----------------------------------------------
+
+    edges =
+      sorted_candidates
       |> Enum.take(@max_associative_links)
-    
-    # Create edges to the most similar nodes
-    edges = 
-      similarities
-      |> Enum.map(fn {node_head, score} ->
+      |> Enum.map(fn {target_id, score} ->
         # Use score as the initial weight for the semantic link
-        Edge.new(node_head.node_id, :semantic, score)
+        Edge.new(target_id, :semantic, score)
       end)
 
     {:ok, edges}
@@ -149,32 +188,37 @@ defmodule CMS.IngestionEngine do
 
 
   defp check_for_conflict(new_node) do
-    # In the decentralized model, check for conflicts by calculating similarity
-    # against all active nodes in the system
+    # 1. SCATTER: Get all PIDs
     all_node_pids = NodeSupervisor.get_all_active_node_pids()
-    
-    # Find any nodes with very high similarity
-    conflicts = 
+
+    # Task.async_stream for parallel conflict checks
+    conflicts =
       all_node_pids
-      |> Enum.map(fn pid ->
+      |> Task.async_stream(fn pid ->
         try do
-          node_state = GenServer.call(pid, :get_head_info, 5000)
-          if node_state && node_state.embedding do
-            score = cosine_similarity(new_node.head.embedding, node_state.embedding)
-            if score >= @conflict_similarity_threshold do
-              {node_state.node_id, score}
-            else
-              nil
-            end
-          else
-            nil
+          # CRITICAL FIX: Use get_drift_info to match inconsistent pattern
+          case GenServer.call(pid, :get_drift_info, @scatter_timeout) do
+             {node_id, remote_embedding, _ver, _reg} ->
+                score = cosine_similarity(new_node.head.embedding, remote_embedding)
+                if score >= @conflict_similarity_threshold do
+                  {node_id, score}
+                else
+                  nil
+                end
+             _ -> nil
           end
         rescue
           _ -> nil
         end
+      end, max_concurrency: @scatter_concurrency, ordered: false)
+
+      # GATHER: Find any conflicts
+      |> Enum.reduce([], fn
+        {:ok, {id, score}}, acc -> [{id, score} | acc]
+        {:ok, nil}, acc -> acc
+        _, acc -> acc
       end)
-      |> Enum.reject(&is_nil/1)
-    
+
     case conflicts do
       [{existing_id, _score} | _] ->
         if new_node.id == existing_id do
@@ -188,17 +232,31 @@ defmodule CMS.IngestionEngine do
   end
 
   # Helper function to calculate cosine similarity
+  # CRITICAL FIX: Correctly handle Nx.Tensor structs
   defp cosine_similarity(vec_a, vec_b) do
     try do
-      # Convert to lists if they're tensors
-      list_a = if is_tuple(vec_a), do: Nx.to_flat_list(vec_a), else: vec_a
-      list_b = if is_tuple(vec_b), do: Nx.to_flat_list(vec_b), else: vec_b
-      
-      dot_product = Enum.zip(list_a, list_b) |> Enum.map(fn {a, b} -> a * b end) |> Enum.sum()
-      norm_a = :math.sqrt(Enum.map(list_a, &(&1 * &1)) |> Enum.sum())
-      norm_b = :math.sqrt(Enum.map(list_b, &(&1 * &1)) |> Enum.sum())
-      
-      if norm_a == 0 or norm_b == 0, do: 0, else: dot_product / (norm_a * norm_b)
+      # Extract list data from Nx.Tensor structs if present
+      list_a = cond do
+        is_struct(vec_a, Nx.Tensor) -> Nx.to_flat_list(vec_a)
+        is_list(vec_a) -> vec_a
+        true -> []
+      end
+
+      list_b = cond do
+        is_struct(vec_b, Nx.Tensor) -> Nx.to_flat_list(vec_b)
+        is_list(vec_b) -> vec_b
+        true -> []
+      end
+
+      if list_a == [] or list_b == [] do
+        0.0
+      else
+        dot_product = Enum.zip(list_a, list_b) |> Enum.map(fn {a, b} -> a * b end) |> Enum.sum()
+        norm_a = :math.sqrt(Enum.map(list_a, &(&1 * &1)) |> Enum.sum())
+        norm_b = :math.sqrt(Enum.map(list_b, &(&1 * &1)) |> Enum.sum())
+
+        if norm_a == 0 or norm_b == 0, do: 0.0, else: dot_product / (norm_a * norm_b)
+      end
     rescue
       _ -> 0.0
     end
@@ -221,8 +279,20 @@ defmodule CMS.IngestionEngine do
       trust_diff > @trust_supersede_threshold ->
         handle_supersedence(new_node, existing_id)
 
+        Phoenix.PubSub.broadcast(CMS.PubSub, "global:signals",
+          {:conflict_resolved, %{type: :superseded, winner: new_node.id, loser: existing_id}}
+        )
+
+        handle_supersedence(new_node, existing_id)
+
       # Case B: Trust is similar or Old node is trusted more -> DIALECTICAL MERGE
       true ->
+        handle_dialectical_merge(new_node, existing_id)
+
+        Phoenix.PubSub.broadcast(CMS.PubSub, "global:signals",
+          {:conflict_resolved, %{type: :dialectical_merge, node_a: new_node.id, node_b: existing_id}}
+        )
+
         handle_dialectical_merge(new_node, existing_id)
     end
   end

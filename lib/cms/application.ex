@@ -22,7 +22,8 @@ defmodule CMS.Application do
       CMS.ModelDriftManager,
       CMS.HebbianBufferSupervisor,
 
-      # 5. NEW: Broadcast Coordinator (Decentralized Cognitive Model)
+      # 5. Ingestion & Query Services
+      CMS.IngestionEngine,
       CMS.BroadcastCoordinator,
 
       # 6. The Node Population

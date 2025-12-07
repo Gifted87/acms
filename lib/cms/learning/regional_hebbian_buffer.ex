@@ -112,11 +112,18 @@ defmodule CMS.RegionalHebbianBuffer do
         entries
         |> Enum.group_by(
           fn {{source, _target}, _delta} -> source end,
-          fn {{_source, target}, delta} -> {target, delta} end
+          fn {{_source, target}, delta} -> [target, delta] end
         )
 
       # 3. Send to LogAppender (Step 7)
       CMS.LogAppender.append_hebbian_updates(grouped_updates)
+      # --- NEW: Broadcast for Real-time Monitoring ---
+      # This proves Neuroplasticity is happening
+      total_updates = length(entries)
+      sample = Enum.at(grouped_updates, 0)
+      Phoenix.PubSub.broadcast(CMS.PubSub, "global:signals",
+        {:hebbian_learning, %{update_count: total_updates, sample: sample}}
+      )
     end
   end
 

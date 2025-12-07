@@ -20,17 +20,20 @@ defmodule CMS.Node do
 
   @spec new(CMS.NodeHead.t(), CMS.NodeBody.t(), map()) :: {:ok, t()} | {:error, any()}
   def new(head, body, provenance_metadata) do
-    # Gap 14: Derive ID from content.
+    # 1. Generate the ID (Content Addressable Hash)
     node_id = CMS.NodeFactory.derive_content_addressable_id(body, provenance_metadata)
 
-    # Use the salience score directly to create the antenna
-    # (Removed unused initial_gain variable)
-    antenna = CMS.NodeAntenna.new(body.data_tail.salience_score)
+    # 2. WRITE BACK: The ID is the checksum. Update the DataTail.
+    updated_tail = %{body.data_tail | checksum: node_id}
+    updated_body = %{body | data_tail: updated_tail}
+
+    # 3. Create Antenna
+    antenna = CMS.NodeAntenna.new(updated_tail.salience_score)
 
     {:ok, %__MODULE__{
       id: node_id,
       head: head,
-      body: body,
+      body: updated_body, # Use the updated body containing the checksum
       antenna: antenna,
       created_at: DateTime.utc_now(),
       last_fired: DateTime.utc_now()
