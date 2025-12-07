@@ -28,6 +28,21 @@ defmodule CMS.TemporalQueryEngine do
     end
   end
 
+  @doc """
+  Reconstructs the ENTIRE state of the knowledge graph at a specific point in time.
+  Used for Temporal Vector Search.
+  """
+  @spec get_system_state_at_time(DateTime.t()) :: {:ok, [map()]} | {:error, any()}
+  def get_system_state_at_time(target_time) do
+    files = find_epoch_files_before(target_time)
+
+    if Enum.empty?(files) do
+      {:ok, []} # No history means empty system
+    else
+      reconstruct_system_state(files, target_time)
+    end
+  end
+
   defp find_epoch_files_before(target_time) do
     matcher = :mnesia.transaction(fn ->
       # FIX: Prefixed unused 'id' with underscore
@@ -86,6 +101,24 @@ defmodule CMS.TemporalQueryEngine do
     end
   end
 
+  defp reconstruct_system_state(file_paths, target_time) do
+    # Accumulator is a Map: %{node_id => node_data}
+    final_map =
+      Enum.reduce(file_paths, %{}, fn path, acc_system ->
+        if File.exists?(path) do
+          File.stream!(path)
+          |> Stream.map(&Jason.decode!/1)
+          |> Enum.reduce(acc_system, fn entry, curr_system ->
+            apply_system_event(curr_system, entry, target_time)
+          end)
+        else
+          acc_system
+        end
+      end)
+
+    {:ok, Map.values(final_map)}
+  end
+
   defp parse_ts(iso_string) do
     case DateTime.from_iso8601(iso_string) do
       {:ok, dt, _} -> dt
@@ -122,4 +155,39 @@ defmodule CMS.TemporalQueryEngine do
 
   # Ignore other events (like hebbian updates which modify state *during* runtime)
   defp apply_event(curr, _), do: curr
+
+  defp apply_system_event(system_map, %{"entity" => "node"} = entry, target_time) do
+    entry_ts = parse_ts(entry["timestamp"])
+
+    # Stop processing if event is in the future relative to target
+    if DateTime.compare(entry_ts, target_time) == :gt do
+      system_map
+    else
+      node_id = entry["id"]
+      type = entry["type"]
+      data = entry["data"]
+
+      case type do
+        "node_created" ->
+          Map.put(system_map, node_id, data)
+
+        "node_updated" ->
+          Map.update(system_map, node_id, data, fn existing ->
+             deep_merge_recursive(existing, data)
+          end)
+
+        "node_migrated" ->
+           Map.update(system_map, node_id, data, fn existing ->
+             deep_merge_recursive(existing, data)
+           end)
+
+        "node_decayed" ->
+           # If decayed/deleted, remove from the snapshot
+           Map.delete(system_map, node_id)
+
+        _ -> system_map
+      end
+    end
+  end
+  defp apply_system_event(system_map, _, _), do: system_map
 end

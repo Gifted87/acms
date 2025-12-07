@@ -87,16 +87,16 @@ defmodule CMS.Web.Router do
       score: score,
       node_id: node.id,
       # 1. Extract Fact
-      fact: node.body.data_head.fact,
+      fact: get_in(node, [:body, :data_head, :fact]) || get_in(node, ["body", "data_head", "fact"]),
       # 2. Extract Data Body (Payloads)
-      data: node.body.data_body,
+      data: get_in(node, [:body, :data_body]) || get_in(node, ["body", "data_body"]),
       # 3. Clean Metadata (No Embeddings/Internal State)
       metadata: %{
         created_at: node.created_at,
         last_fired: node.last_fired,
-        checksum: node.body.data_tail.checksum,
+        checksum: get_in(node, [:body, :data_tail, :checksum]) || get_in(node, ["body", "data_tail", "checksum"]),
         # Handle the nil pointer for new nodes
-        version: node.body.data_tail.versioning_pointer || "v1 (genesis)"
+        version: get_in(node, [:body, :data_tail, :versioning_pointer]) || get_in(node, ["body", "data_tail", "versioning_pointer"]) || "v1 (genesis)"
       }
     }
   end
@@ -283,40 +283,81 @@ defmodule CMS.Web.Router do
     })
   end
 
-  # FIX: Underscored unused variables since this is a placeholder stub
-  defp execute_temporal_search(conn, _vector, _model, dt, _max_results, _min_relevance) do
-    # NOTE: Temporal search in the decentralized model is more complex and would require
-    # a different approach than the original VectorRouter-based method.
-    # For now, we return an informative message.
-    Logger.warning("Temporal search not fully implemented in decentralized model. Using fallback approach.")
+  defp execute_temporal_search(conn, vector, _model, dt, max_results, min_relevance) do
+    # 1. Fetch the reconstructed history from the Engine
+    case CMS.TemporalQueryEngine.get_system_state_at_time(dt) do
+      {:ok, nodes} ->
+        # 2. Brute-force Vector Scan in Memory
+        results =
+          nodes
+          |> Enum.map(fn node ->
+            # Extract embedding safely (it will be a list of floats from JSON)
+            node_embedding = get_in(node, ["head", "embedding"])
 
-    # For now, return an empty result with a warning
-    send_json(conn, 200, %{
-      query_type: "temporal",
-      as_of: DateTime.to_iso8601(dt),
-      count: 0,
-      results: [],
-      warning: "Temporal search not fully implemented in decentralized model yet"
-    })
+            if node_embedding do
+              # Convert list back to tensor for math
+              tensor_emb = if is_list(node_embedding), do: Nx.tensor(node_embedding), else: node_embedding
+              score = cosine_similarity(vector, tensor_emb)
+              {score, node}
+            else
+              {0.0, node}
+            end
+          end)
+          |> Enum.filter(fn {score, _} -> score >= min_relevance end)
+          |> Enum.sort_by(fn {score, _} -> score end, :desc)
+          |> Enum.take(max_results)
+          |> Enum.map(fn {score, node} -> format_public_response(score, node) end)
+
+        send_json(conn, 200, %{
+          query_type: "temporal",
+          as_of: DateTime.to_iso8601(dt),
+          count: length(results),
+          results: results
+        })
+
+      _ ->
+        send_json(conn, 500, %{error: "Failed to reconstruct history"})
+    end
   end
 
-  # FIX: Deleted unused cosine_similarity/2
-  # FIX: Deleted unused fetch_active_or_historical_node/1
+  defp cosine_similarity(vec_a, vec_b) do
+    try do
+      # Handle both Tensors and Lists
+      list_a = if is_struct(vec_a, Nx.Tensor), do: Nx.to_flat_list(vec_a), else: vec_a
+      list_b = if is_struct(vec_b, Nx.Tensor), do: Nx.to_flat_list(vec_b), else: vec_b
+
+      dot_product = Enum.zip(list_a, list_b) |> Enum.map(fn {a, b} -> a * b end) |> Enum.sum()
+      norm_a = :math.sqrt(Enum.map(list_a, &(&1 * &1)) |> Enum.sum())
+      norm_b = :math.sqrt(Enum.map(list_b, &(&1 * &1)) |> Enum.sum())
+
+      if norm_a == 0 or norm_b == 0, do: 0.0, else: dot_product / (norm_a * norm_b)
+    rescue
+      _ -> 0.0
+    end
+  end
+
+  defp fetch_active_or_historical_node(node_id) do
+    if pid = CMS.NodeSupervisor.get_node_pid(node_id) do
+      try do
+        GenServer.call(pid, :get_state_snapshot, 1000)
+      rescue _ -> nil end
+    else
+      # If not active, try to fetch the LATEST known state from history
+      case CMS.TemporalQueryEngine.get_node_state_at_time(node_id, DateTime.utc_now()) do
+        {:ok, node} -> node
+        _ -> nil
+      end
+    end
+  end
 
   # ----------------------------------------------------------------------------
   # 3. NODE MANAGEMENT API
   # ----------------------------------------------------------------------------
   get "/api/v1/nodes/:id" do
     id = conn.path_params["id"]
-    case NodeSupervisor.get_node_pid(id) do
-      nil -> fetch_from_history(conn, id)
-      pid ->
-        try do
-          state = GenServer.call(pid, :get_state_snapshot, 5000)
-          send_json(conn, 200, state)
-        catch
-          _, _ -> fetch_from_history(conn, id)
-        end
+    case fetch_active_or_historical_node(id) do
+      nil -> send_json(conn, 404, %{error: "Node not found in active memory or history"})
+      node -> send_json(conn, 200, node)
     end
   end
 
@@ -445,13 +486,6 @@ defmodule CMS.Web.Router do
     conn
     |> put_resp_content_type("application/json")
     |> send_resp(status, Jason.encode!(data))
-  end
-
-  defp fetch_from_history(conn, id) do
-    case TemporalQueryEngine.get_node_state_at_time(id, DateTime.utc_now()) do
-      {:ok, node_data} -> send_json(conn, 200, node_data)
-      _ -> send_json(conn, 404, %{error: "Node not found"})
-    end
   end
 
   defp validate_params(params, required_keys) do
