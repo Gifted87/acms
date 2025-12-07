@@ -88,13 +88,9 @@ defmodule CMS.NodeActor do
   @impl true
   def handle_info({:query, context}, state) do
     if state.hydrated? do
-      trace = Map.get(context, :trace, MapSet.new())
-
-      if MapSet.member?(trace, state.node.id) do
-        {:noreply, state}
-      else
-        process_activation(:primary, context, state, 0.0)
-      end
+      # NodeAntenna receives query and passes to NodeHead for autonomous evaluation
+      # This is the new decentralized approach: every node evaluates every query
+      autonomous_query_evaluation(context, state)
     else
       {:noreply, state}
     end
@@ -443,6 +439,44 @@ defmodule CMS.NodeActor do
   defp reinforce_link(node, target_id, region_id) do
     if target_id and Enum.any?(node.body.data_tail.relationship_metadata, fn e -> e.target_node_id == target_id end) do
       RegionalHebbianBuffer.buffer_update(node.id, [{target_id, 0.05}], region_id)
+    end
+  end
+
+  # Autonomous query evaluation: NodeHead independently decides if query is relevant
+  defp autonomous_query_evaluation(context, state) do
+    node = state.node
+
+    # Calculate relevance score between query and node's embedding
+    relevance = calculate_relevance(node, context)
+
+    # NodeHead applies its own relevance threshold
+    threshold = node.head.relevance_threshold
+
+    # Apply metabolic state cost factor
+    cost = case node.head.internal_state do
+      :high_energy -> 0.9
+      :low_energy -> 1.2
+      :hibernating -> 1.5
+      _ -> 1.0
+    end
+
+    # Apply global inhibition factor (spreading activation damping)
+    inhibit = ActivationEngine.get_global_inhibition_factor()
+    adjusted_threshold = (threshold / max(0.1, inhibit)) * cost
+
+    # Autonomous decision: Node fires if relevance meets threshold
+    if relevance >= adjusted_threshold do
+      agent_id = Map.get(context, :agent_id, "unknown")
+
+      if Security.can_read?(agent_id, node.body.data_tail.acls) do
+        # Node fires autonomously
+        fire_node(:primary, relevance, context, state, 0)
+      else
+        {:noreply, state}
+      end
+    else
+      # Node decides it's not relevant - no action taken
+      {:noreply, state}
     end
   end
 

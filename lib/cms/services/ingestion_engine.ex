@@ -2,7 +2,7 @@ defmodule CMS.IngestionEngine do
   use GenServer
   require Logger
 
-  alias CMS.{Node, VectorRouter, LogAppender, NodeSupervisor, Security, MetaNode, Edge}
+  alias CMS.{Node, LogAppender, NodeSupervisor, Security, MetaNode, Edge}
 
   @moduledoc """
   The Gatekeeper. Orchestrates the Zero-Friction Ingestion Protocol.
@@ -15,8 +15,8 @@ defmodule CMS.IngestionEngine do
   1. Validate incoming data payloads (FIDs).
   2. Enforce Security (ACLs).
   3. Generate Embeddings & Salience Scores.
-  4. Detect Conflicts via Vector Search & Trust Scores.
-  5. Finalize Persistence (Log, Index, Spawn).
+  4. Detect Conflicts via direct similarity calculation.
+  5. Finalize Persistence (Log, Spawn).
   """
 
   # Configuration
@@ -106,70 +106,101 @@ defmodule CMS.IngestionEngine do
   end
 
   # --- FIX 1: Automated Association / Hebbian Priming Logic ---
-  defp prime_initial_edges(embedding, model_version) do
-    # Query VectorRouter for top N semantic neighbors
-    query_result = VectorRouter.query(
-      embedding,
-      model_version,
-      k: @max_associative_links,
-      threshold: @min_associative_score # Pass threshold to VectorRouter
-    )
+  defp prime_initial_edges(embedding, _model_version) do
+    # In the decentralized model, we find similar nodes by calculating similarity
+    # against all active nodes in the system
+    all_node_pids = NodeSupervisor.get_all_active_node_pids()
+    
+    # Calculate similarity with all active nodes
+    similarities = 
+      all_node_pids
+      |> Enum.map(fn pid ->
+        try do
+          node_state = GenServer.call(pid, :get_head_info, 5000)
+          if node_state && node_state.embedding do
+            score = cosine_similarity(embedding, node_state.embedding)
+            if score >= @min_associative_score do
+              {node_state, score}
+            else
+              nil
+            end
+          else
+            nil
+          end
+        rescue
+          _ -> nil
+        end
+      end)
+      |> Enum.reject(&is_nil/1)
+      |> Enum.sort_by(fn {_, score} -> score end, &>=/2)
+      |> Enum.take(@max_associative_links)
+    
+    # Create edges to the most similar nodes
+    edges = 
+      similarities
+      |> Enum.map(fn {node_head, score} ->
+        # Use score as the initial weight for the semantic link
+        Edge.new(node_head.node_id, :semantic, score)
+      end)
 
-    case query_result do
-      {:ok, candidates} ->
-        edges = candidates
-        # Redundant filter in case VectorRouter ignores threshold
-        |> Enum.filter(fn {_id, score} -> score >= @min_associative_score end)
-        |> Enum.map(fn {target_id, score} ->
-          # Use score as the initial weight for the semantic link
-          Edge.new(target_id, :semantic, score)
-        end)
-
-        {:ok, edges}
-
-      {:error, reason} ->
-        Logger.warning("VectorRouter failed to prime edges: #{inspect(reason)}. Continuing with no initial links.")
-        {:ok, []}
-
-      _ -> {:ok, []}
-    end
+    {:ok, edges}
   end
   # ------------------------------------------------------------------------
 
 
   defp check_for_conflict(new_node) do
-    # Query VectorRouter for very high similarity neighbors
-    query_result = VectorRouter.query(
-      new_node.head.embedding,
-      new_node.head.embedding_model_version,
-      k: 1, # Top 1
-      threshold: @conflict_similarity_threshold # Only look for nearly identical matches
-    )
-
-    case query_result do
-      {:ok, candidates} ->
-        case candidates do
-          [{existing_id, score} | _] ->
-            # High vector similarity found.
-            # Double check score and ID
+    # In the decentralized model, check for conflicts by calculating similarity
+    # against all active nodes in the system
+    all_node_pids = NodeSupervisor.get_all_active_node_pids()
+    
+    # Find any nodes with very high similarity
+    conflicts = 
+      all_node_pids
+      |> Enum.map(fn pid ->
+        try do
+          node_state = GenServer.call(pid, :get_head_info, 5000)
+          if node_state && node_state.embedding do
+            score = cosine_similarity(new_node.head.embedding, node_state.embedding)
             if score >= @conflict_similarity_threshold do
-              if new_node.id == existing_id do
-                :ok # Exact duplicate content (ID matches). Idempotent.
-              else
-                {:conflict, existing_id} # Different ID but almost identical meaning -> Potential Conflict.
-              end
+              {node_state.node_id, score}
             else
-              :ok # Score wasn't high enough (redundant safety)
+              nil
             end
-          _ ->
-            :ok
+          else
+            nil
+          end
+        rescue
+          _ -> nil
         end
-
-      {:error, _reason} ->
-        # If the index is empty or fails, we assume no conflict exists.
+      end)
+      |> Enum.reject(&is_nil/1)
+    
+    case conflicts do
+      [{existing_id, _score} | _] ->
+        if new_node.id == existing_id do
+          :ok # Exact duplicate content (ID matches). Idempotent.
+        else
+          {:conflict, existing_id} # Different ID but almost identical meaning -> Potential Conflict.
+        end
+      _ ->
         :ok
+    end
+  end
 
-       _ -> :ok
+  # Helper function to calculate cosine similarity
+  defp cosine_similarity(vec_a, vec_b) do
+    try do
+      # Convert to lists if they're tensors
+      list_a = if is_tuple(vec_a), do: Nx.to_flat_list(vec_a), else: vec_a
+      list_b = if is_tuple(vec_b), do: Nx.to_flat_list(vec_b), else: vec_b
+      
+      dot_product = Enum.zip(list_a, list_b) |> Enum.map(fn {a, b} -> a * b end) |> Enum.sum()
+      norm_a = :math.sqrt(Enum.map(list_a, &(&1 * &1)) |> Enum.sum())
+      norm_b = :math.sqrt(Enum.map(list_b, &(&1 * &1)) |> Enum.sum())
+      
+      if norm_a == 0 or norm_b == 0, do: 0, else: dot_product / (norm_a * norm_b)
+    rescue
+      _ -> 0.0
     end
   end
 
@@ -291,10 +322,7 @@ defmodule CMS.IngestionEngine do
     # 1. Persist to Epoch Log (Immutable History)
     LogAppender.append_node_event(node.id, :node_created, node)
 
-    # 2. Add to Vector Index (Searchable)
-    VectorRouter.add_embedding(node.id, node.head.embedding, node.head.embedding_model_version)
-
-    # 3. Spawn NodeActor (Active Memory)
+    # 2. Spawn NodeActor (Active Memory) - No vector index needed in decentralized model
     case NodeSupervisor.start_child(node) do
       {:ok, _pid} -> {:ok, node.id}
       {:error, {:already_started, _}} -> {:ok, node.id} # Idempotency
