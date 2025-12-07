@@ -14,7 +14,7 @@ defmodule CMS.Application do
       # 3. Persistence Layer
       CMS.EpochManager,
       CMS.LogAppender,
-      CMS.VectorRouter,
+      # REMOVED: CMS.VectorRouter (No longer needed in decentralized model)
 
       # 4. Learning & Regulation Layer
       CMS.ActivationEngine,
@@ -22,10 +22,8 @@ defmodule CMS.Application do
       CMS.ModelDriftManager,
       CMS.HebbianBufferSupervisor,
 
-      # 5. Pipeline & Ingestion
-      # REMOVED: CMS.QueryRouter (It is started by CMS.BusPipeline)
-      CMS.BusPipeline,
-      CMS.IngestionEngine,
+      # 5. NEW: Broadcast Coordinator (Decentralized Cognitive Model)
+      CMS.BroadcastCoordinator,
 
       # 6. The Node Population
       CMS.NodeSupervisor,

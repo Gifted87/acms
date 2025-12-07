@@ -68,7 +68,7 @@ defmodule CMS.Web.Router do
   use Plug.Router
   require Logger
 
-  alias CMS.{IngestionEngine, QueryRouter, QueryCoordinator, TemporalQueryEngine, NodeSupervisor, VectorRouter}
+  alias CMS.{IngestionEngine, QueryCoordinator, TemporalQueryEngine, NodeSupervisor}
   alias CMS.{DataBodyPayload, FIDValidator, Tool.Embedder}
 
   plug Plug.Logger
@@ -194,7 +194,7 @@ defmodule CMS.Web.Router do
     [CMS.SemanticRegion.compute_region_hash(vector, model)]
   end
 
-  # --- CRITICAL UPDATE: Implements Two-Phase Query with Global Fallback ---
+  # --- CRITICAL UPDATE: Implements Decentralized Query with Broadcast to All Nodes ---  
   defp execute_live_query(conn, ctx) do
     query_id = UUID.uuid4()
 
@@ -211,92 +211,40 @@ defmodule CMS.Web.Router do
       system_mode: safe_atom_cast(ctx.params["system_mode"], :normal, [:normal, :emergency])
     }
 
-    # ----------------------------------------------------------------------
-    # PHASE 1: Targeted Search (Efficient)
-    # ----------------------------------------------------------------------
-    {:ok, coord_pid} = QueryCoordinator.start_link(query_id, ctx.target_regions, self())
+    # NEW: Start a coordinator to collect responses from nodes that fire
+    {:ok, coord_pid} = QueryCoordinator.start_link(query_id, [0], self()) # Single dummy region for tracking
     ref = Process.monitor(coord_pid)
 
-    # 1.a Inject VectorRouter Results (The "Guaranteed Match" path)
-    k = ctx.params["max_results"] || 50
-    min_rel = ctx.params["min_relevance"] || 0.6
+    # NEW: Broadcast query to ALL nodes using the decentralized coordinator
+    CMS.BroadcastCoordinator.broadcast_query(query_context)
 
-    case VectorRouter.query(ctx.query_vector, ctx.model, k: k) do
-        {:ok, candidates} ->
-            Enum.each(candidates, fn {node_id, score} ->
-                if score >= min_rel do
-                    node_data = fetch_active_or_historical_node(node_id)
-                    if node_data do
-                        # Direct injection bypasses NodeActor activation threshold
-                        QueryCoordinator.node_fired(query_id, node_id, score, node_data)
-                    end
-                end
-            end)
-        _ -> :ok
-    end
-
-    # 1.b Targeted Spreading Activation
-    QueryRouter.broadcast_query(query_context, ctx.target_regions)
-
-    # Wait for Phase 1 Results
-    phase_1_results =
+    # Wait for results with timeout
+    results = 
       receive do
-        {:query_result, ^query_id, results} ->
+        {:query_result, ^query_id, received_results} ->
           Process.demonitor(ref, [:flush])
-          results
+          received_results
         {:DOWN, ^ref, :process, _pid, _reason} ->
           []
-      after 5000 -> # Short timeout for Phase 1
+      after 10000 -> # 10 second timeout for global broadcast
           Process.demonitor(ref, [:flush])
           []
-      end
-
-    # ----------------------------------------------------------------------
-    # PHASE 2: Global Fallback (Safety Net)
-    # If Phase 1 returned nothing, broadcast to ALL regions.
-    # ----------------------------------------------------------------------
-    final_results =
-      if phase_1_results == [] do
-        Logger.warning("Targeted Query #{query_id} returned 0 results. Triggering Global Broadcast Fallback.")
-
-        fallback_id = UUID.uuid4()
-        all_regions = Enum.to_list(0..255) # Broadcast to everyone
-
-        {:ok, fb_coord} = QueryCoordinator.start_link(fallback_id, all_regions, self())
-        fb_ref = Process.monitor(fb_coord)
-
-        # Update ID in context so nodes treat it as a new pulse
-        fallback_context = %{query_context | query_id: fallback_id}
-
-        QueryRouter.broadcast_query(fallback_context, all_regions)
-
-        receive do
-          {:query_result, ^fallback_id, fb_results} ->
-            Process.demonitor(fb_ref, [:flush])
-            fb_results
-          {:DOWN, ^fb_ref, :process, _, _} -> []
-        after 10000 -> # Longer timeout for global search
-            Process.demonitor(fb_ref, [:flush])
-            []
-        end
-      else
-        phase_1_results
       end
 
     # Response Construction
     limit = ctx.params["max_results"] || 50
 
-    # CRITICAL FIX: Transform tuples {score, node} to Maps %{score: s, node: n} for JSON encoding
+    # Transform tuples {score, node} to Maps %{score: s, node: n} for JSON encoding
     trimmed_results =
-      final_results
+      results
       |> Enum.take(limit)
       |> Enum.map(fn {score, node} -> %{score: score, node: node} end)
 
     send_json(conn, 200, %{
-      query_id: query_id, # Note: if fallback used, this is still original ID reference
+      query_id: query_id,
       count: length(trimmed_results),
       results: trimmed_results,
-      fallback_triggered: (phase_1_results == [])
+      fallback_triggered: false # No fallback needed in new model
     })
   end
 
@@ -314,31 +262,36 @@ defmodule CMS.Web.Router do
   end
 
   defp execute_temporal_search(conn, vector, model, dt, max_results, min_relevance) do
-    # 1. Use Vector Router to find *current* candidates (Heuristic approach)
-    {:ok, candidates} = VectorRouter.query(vector, model, k: max_results * 2)
-
-    # 2. Reconstruct History for candidates
-    historical_results =
-      candidates
-      |> Enum.map(fn {id, score} ->
-        case TemporalQueryEngine.get_node_state_at_time(id, dt) do
-          {:ok, node} ->
-            # Inject the similarity score from the index for sorting
-            Map.put(node, "search_score", score)
-          _ -> nil # Node didn't exist at that time
-        end
-      end)
-      |> Enum.reject(&is_nil/1)
-      |> Enum.filter(fn node -> node["search_score"] >= min_relevance end)
-      |> Enum.sort_by(fn node -> node["search_score"] end, :desc)
-      |> Enum.take(max_results)
-
+    # NOTE: Temporal search in the decentralized model is more complex and would require
+    # a different approach than the original VectorRouter-based method. 
+    # For now, we return an informative message.
+    Logger.warning("Temporal search not fully implemented in decentralized model. Using fallback approach.")
+    
+    # For now, return an empty result with a warning
     send_json(conn, 200, %{
       query_type: "temporal",
       as_of: DateTime.to_iso8601(dt),
-      count: length(historical_results),
-      results: historical_results
+      count: 0,
+      results: [],
+      warning: "Temporal search not fully implemented in decentralized model yet"
     })
+  end
+
+  # Helper function to calculate cosine similarity
+  defp cosine_similarity(vec_a, vec_b) do
+    try do
+      # Convert to lists if they're tensors
+      list_a = if is_tuple(vec_a), do: Nx.to_flat_list(vec_a), else: vec_a
+      list_b = if is_tuple(vec_b), do: Nx.to_flat_list(vec_b), else: vec_b
+      
+      dot_product = Enum.zip(list_a, list_b) |> Enum.map(fn {a, b} -> a * b end) |> Enum.sum()
+      norm_a = :math.sqrt(Enum.map(list_a, &(&1 * &1)) |> Enum.sum())
+      norm_b = :math.sqrt(Enum.map(list_b, &(&1 * &1)) |> Enum.sum())
+      
+      if norm_a == 0 or norm_b == 0, do: 0, else: dot_product / (norm_a * norm_b)
+    rescue
+      _ -> 0.0
+    end
   end
 
   # ----------------------------------------------------------------------------
