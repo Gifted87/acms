@@ -38,6 +38,10 @@ defmodule CMS.EpochManager do
     GenServer.call(__MODULE__, :rotate)
   end
 
+  def list_epoch_files do
+    GenServer.call(__MODULE__, :list_files)
+  end
+
   # Callbacks
 
   @impl true
@@ -64,6 +68,24 @@ defmodule CMS.EpochManager do
   def handle_call(:rotate, _from, state) do
     new_state = rotate_epoch(state)
     {:reply, :ok, new_state}
+  end
+
+  @impl true
+  def handle_call(:list_files, _from, state) do
+    # Fetch all epochs from Mnesia, sorted by start time
+    files = :mnesia.transaction(fn ->
+      :mnesia.match_object({@table_name, :_, :_, :_, :_})
+    end)
+    
+    sorted_paths = case files do
+      {:atomic, list} ->
+        list
+        |> Enum.sort_by(fn {_, _, start_time, _, _} -> start_time end, DateTime)
+        |> Enum.map(fn {_, _, _, _, path} -> path end)
+      _ -> []
+    end
+    
+    {:reply, sorted_paths, state}
   end
 
   @impl true

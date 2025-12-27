@@ -6,10 +6,7 @@ config :acn_cms, CMS.PubSub,
   adapter: Phoenix.PubSub.PG2,
   pool_size: 1
 
-# Configure Mnesia for Temporal Query Engine and Epoch Logs (Section 9.1)
-# Ensures disk-based persistence for the "Immutable History".
-config :mnesia,
-  dir: "priv/data/mnesia_store"
+
 
 # Configure Logger for structured auditing (Radical Transparency)
 config :logger, :console,

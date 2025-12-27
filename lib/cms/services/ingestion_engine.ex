@@ -54,7 +54,7 @@ defmodule CMS.IngestionEngine do
   def handle_call({:ingest, req}, _from, state) do
     # Step 1: Validation & Security
     with :ok <- validate_payloads(req.description_payloads),
-         true <- Security.can_write?(req.agent_id, req.acls || ["public"]) do
+         true <- Security.can_write?(req.agent_id, req.acls || %{read: ["public"], write: ["system"]}) do
 
       # Step 2: Embedding & Identity Construction
       # We default to the standard model version
@@ -73,18 +73,21 @@ defmodule CMS.IngestionEngine do
 
       data_tail = CMS.DataTail.new(salience, initial_edges, req.acls || ["public"])
 
-      # --- LOGGING: Inspect the DataTail to verify relationships ---
-      Logger.info("""
-      [Ingestion] Constructed DataTail for new fact: "#{String.slice(req.fact_text, 0, 50)}..."
-      Relationships: #{length(initial_edges)} found.
-      DataTail Dump: #{inspect(data_tail)}
-      """)
-      # -------------------------------------------------------------
+
 
       node_body = CMS.NodeBody.new(data_head, req.description_payloads, data_tail)
 
       # Create Node Struct (ID is derived here via Content Addressability)
       {:ok, new_node} = Node.new(node_head, node_body, req.provenance)
+
+      # --- LOGGING: Inspect the DataTail to verify relationships ---
+      Logger.info("[Ingestion] Node Created: #{new_node.id} | Relationships: #{length(initial_edges)}")
+      Logger.debug("""
+      [Ingestion] Constructed DataTail for new fact: "#{String.slice(req.fact_text, 0, 50)}..."
+      Relationships: #{length(initial_edges)} found.
+      DataTail Dump: #{inspect(data_tail)}
+      """)
+      # -------------------------------------------------------------
 
       # Step 3: Conflict Detection & Trust Arbitration (Fix 4)
       # We check if a very similar node already exists (optimized with Scatter-Gather)

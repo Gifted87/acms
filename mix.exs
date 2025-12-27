@@ -7,14 +7,15 @@ defmodule AcnCms.MixProject do
       version: "1.0.0",
       elixir: "~> 1.14",
       start_permanent: Mix.env() == :prod,
-      deps: deps()
+      deps: deps(),
+      xref: [exclude: [:mnesia]]
     ]
   end
 
   # Run "mix help compile.app" to learn about applications.
   def application do
     [
-      extra_applications: [:logger, :mnesia, :crypto],
+      extra_applications: [:logger, :crypto],
       mod: {CMS.Application, []}
     ]
   end

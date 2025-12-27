@@ -70,33 +70,49 @@ defmodule CMS.Web.Router do
 
   alias CMS.{IngestionEngine, QueryCoordinator, TemporalQueryEngine, NodeSupervisor}
   alias CMS.{DataBodyPayload, FIDValidator, Tool.Embedder}
+  alias CMS.Ingestion.Orchestrator
 
   plug Plug.Logger
   plug Plug.Parsers,
-    parsers: [:json],
-    pass: ["application/json"],
+    parsers: [:urlencoded, :multipart, :json],
+    pass: ["*/*"],
     json_decoder: Jason,
-    length: 10_000_000
+    length: 100_000_000
 
   plug :match
   plug :dispatch
 
+  # --- CRITICAL FIX: Safe Response Formatting for Structs vs Maps ---
 
-  defp format_public_response(score, node) do
+  # Clause 1: Handle %CMS.Node{} structs (from Live Query / NodeActor)
+  defp format_public_response(score, %CMS.Node{} = node) do
     %{
       score: score,
       node_id: node.id,
-      # 1. Extract Fact
-      fact: get_in(node, [:body, :data_head, :fact]) || get_in(node, ["body", "data_head", "fact"]),
-      # 2. Extract Data Body (Payloads)
-      data: get_in(node, [:body, :data_body]) || get_in(node, ["body", "data_body"]),
-      # 3. Clean Metadata (No Embeddings/Internal State)
+      fact: node.body.data_head.fact,
+      data: node.body.data_body,
       metadata: %{
         created_at: node.created_at,
         last_fired: node.last_fired,
-        checksum: get_in(node, [:body, :data_tail, :checksum]) || get_in(node, ["body", "data_tail", "checksum"]),
-        # Handle the nil pointer for new nodes
-        version: get_in(node, [:body, :data_tail, :versioning_pointer]) || get_in(node, ["body", "data_tail", "versioning_pointer"]) || "v1 (genesis)"
+        checksum: node.body.data_tail.checksum,
+        version: node.body.data_tail.versioning_pointer || "v1 (genesis)"
+      }
+    }
+  end
+
+  # Clause 2: Handle Map (from TemporalQueryEngine / JSON History)
+  defp format_public_response(score, node) when is_map(node) do
+    %{
+      score: score,
+      node_id: Map.get(node, "id"),
+      # Use get_in with strings for nested JSON map access
+      fact: get_in(node, ["body", "data_head", "fact"]),
+      data: get_in(node, ["body", "data_body"]),
+      metadata: %{
+        created_at: Map.get(node, "created_at"),
+        last_fired: Map.get(node, "last_fired"),
+        checksum: get_in(node, ["body", "data_tail", "checksum"]),
+        version: get_in(node, ["body", "data_tail", "versioning_pointer"]) || "v1 (genesis)"
       }
     }
   end
@@ -104,6 +120,47 @@ defmodule CMS.Web.Router do
   # ----------------------------------------------------------------------------
   # 1. INGESTION API
   # ----------------------------------------------------------------------------
+  post "/api/v1/ingest/blob" do
+    text = conn.body_params["text"]
+    meta = conn.body_params["metadata"] || %{}
+    filename = meta["filename"] || "blob.txt"
+    
+    if text do
+       tmp_path = Path.join(System.tmp_dir!(), "#{UUID.uuid4()}_#{filename}")
+       File.write!(tmp_path, text)
+       
+       _task = Orchestrator.start_ingestion(tmp_path)
+       send_json(conn, 202, %{status: "accepted", job_id: "async_ingest"})
+    else
+       send_json(conn, 400, %{error: "Missing text field"})
+    end
+  end
+
+  post "/api/v1/ingest/upload" do
+    case conn.body_params["file"] do
+      %Plug.Upload{path: tmp_path, filename: filename} ->
+         if Path.extname(filename) == ".zip" do
+            dest = Path.join(System.tmp_dir!(), "#{UUID.uuid4()}_extracted")
+            File.mkdir!(dest)
+            # Use Erlang zip module
+            case :zip.unzip(String.to_charlist(tmp_path), [{:cwd, String.to_charlist(dest)}]) do
+               {:ok, _} ->
+                  Orchestrator.start_ingestion(dest)
+                  send_json(conn, 202, %{status: "accepted", type: "zip"})
+               {:error, reason} ->
+                  send_json(conn, 400, %{error: "Zip extraction failed", details: inspect(reason)})
+            end
+         else
+            new_path = Path.join(System.tmp_dir!(), "#{UUID.uuid4()}_#{filename}")
+            File.cp!(tmp_path, new_path)
+            Orchestrator.start_ingestion(new_path)
+            send_json(conn, 202, %{status: "accepted", type: "file"})
+         end
+      _ ->
+         send_json(conn, 400, %{error: "No file provided"})
+    end
+  end
+
   post "/api/v1/ingest" do
     with {:ok, params} <- validate_params(conn.body_params, ["fact_text", "description_payloads", "agent_id"]),
          {:ok, payloads} <- parse_and_validate_payloads(params["description_payloads"]),

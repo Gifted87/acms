@@ -47,28 +47,47 @@ defmodule CMS.VectorRouter do
     GenServer.call(__MODULE__, :persist)
   end
 
+  @doc "Destroys all indices on disk. Hazardous."
+  def clean_slate do
+    File.rm_rf(@base_index_dir)
+  end
+  
+  @doc "Optimized bulk insertion for Rehydration."
+  def bulk_add(items, model_version) do
+    # items is a list of {node_id, embedding_tensor}
+    GenServer.call(__MODULE__, {:bulk_add, items, model_version}, 60_000)
+  end
+
   # --- Server Callbacks ---
 
   @impl true
   def init(_opts) do
-    Logger.info("CMS.VectorRouter: Initializing with CLEAN SLATE strategy...")
-
-    # 1. CLEAN SLATE: Remove old indices to prevent corruption loops
-    File.rm_rf(@base_index_dir)
+    # 1. Ensure Index directory exists
     File.mkdir_p!(@base_index_dir)
 
-    # 2. Initialize Mnesia
+    # 2. Initialize Mnesia (Safe to call multiple times if handled)
     init_mnesia()
 
-    # 3. Create fresh indices with error handling
+    # 3. Load or Create indices
     {initial_indices, initial_counts} =
       Enum.reduce(@supported_models, {[], []}, fn model, {indices_acc, counts_acc} ->
-        case HNSWLib.Index.new(:cosine, @dim, @max_elements) do
-          {:ok, index} ->
+        path = index_file_path(model)
+        
+        case attempt_load_index(model, path) do
+          {:ok, index, count} ->
+            Logger.info("CMS.VectorRouter: Loaded existing index for #{model} (#{count} items).")
+            {[{model, index} | indices_acc], [{model, count} | counts_acc]}
+            
+          {:error, :not_found} ->
+            Logger.info("CMS.VectorRouter: No index found for #{model}. Creating fresh.")
+            {:ok, index} = HNSWLib.Index.new(:cosine, @dim, @max_elements)
             {[{model, index} | indices_acc], [{model, 0} | counts_acc]}
+
           {:error, reason} ->
-            Logger.error("Failed to create HNSW index for #{model}: #{inspect(reason)}")
-            {indices_acc, counts_acc}
+            Logger.error("CMS.VectorRouter: Failed to load index for #{model}: #{inspect(reason)}. Creating fresh.")
+            File.rm(path)
+            {:ok, index} = HNSWLib.Index.new(:cosine, @dim, @max_elements)
+            {[{model, index} | indices_acc], [{model, 0} | counts_acc]}
         end
       end)
 
@@ -130,6 +149,64 @@ defmodule CMS.VectorRouter do
              {:reply, {:error, :nif_crash}, state}
         end
 
+      _ ->
+        {:reply, {:error, :unsupported_model}, state}
+    end
+  end
+
+  @impl true
+  def handle_call({:bulk_add, items, model_version}, _from, state) do
+    case Map.fetch(state.indices, model_version) do
+      {:ok, index} when not is_nil(index) ->
+        # 1. Prepare batch
+        # items is [{node_id, tensor}]
+        # Need to separate into a Tensor Batch and a List of IDs
+        
+        {ids, tensors} = Enum.reduce(items, {[], []}, fn {node_id, tensor}, {id_acc, t_acc} ->
+             # Generate ID
+             item_id = :erlang.phash2(node_id, 2_147_483_647)
+             
+             # Shape Check
+             t = case Nx.rank(tensor) do
+               1 -> Nx.new_axis(tensor, 0)
+               _ -> tensor
+             end
+             
+             {[item_id | id_acc], [t | t_acc]}
+        end)
+        
+        # Nx.concatenate requires same-shaped tensors. 
+        # Since we new_axis'd them to [1, 384], concat on axis 0 gives [N, 384].
+        if Enum.empty?(tensors) do
+           {:reply, :ok, state}
+        else
+           # Reverse to maintain order (reduce prepends)
+           final_tensors = Enum.reverse(tensors) |> Nx.concatenate(axis: 0)
+           final_ids = Enum.reverse(ids)
+           
+           # Direct HNSW Bulk Add
+           case HNSWLib.Index.add_items(index, final_tensors, ids: final_ids) do
+             :ok ->
+               # Bulk Write Mnesia Mappings
+               mappings = Enum.zip(final_ids, Enum.map(items, fn {nid, _} -> nid end))
+               
+               :mnesia.transaction(fn -> 
+                  Enum.each(mappings, fn {iid, nid} ->
+                    :mnesia.write({@id_map_table, iid, nid})
+                  end)
+               end)
+               
+               new_count = Map.get(state.insertion_count, model_version, 0) + length(items)
+               new_dirty = MapSet.put(state.dirty_models, model_version)
+               
+               {:reply, :ok, %{state | insertion_count: Map.put(state.insertion_count, model_version, new_count), dirty_models: new_dirty}}
+               
+             {:error, reason} ->
+                Logger.error("HNSW Bulk Add Failed: #{inspect(reason)}")
+                {:reply, {:error, reason}, state}
+           end
+        end
+        
       _ ->
         {:reply, {:error, :unsupported_model}, state}
     end
@@ -218,13 +295,32 @@ defmodule CMS.VectorRouter do
 
   # --- Internals ---
 
+  defp attempt_load_index(_model, path) do
+    if File.exists?(path) do
+      case HNSWLib.Index.load_index(:cosine, @dim, path) do
+        {:ok, index} ->
+          count = :mnesia.async_dirty(fn -> 
+            :mnesia.table_info(@id_map_table, :size)
+          end)
+          {:ok, index, count}
+        {:error, reason} -> {:error, reason}
+      end
+    else
+      {:error, :not_found}
+    end
+  end
+
   defp init_mnesia do
     nodes = [Node.self()]
-    :mnesia.create_table(@id_map_table, [
+    case :mnesia.create_table(@id_map_table, [
       attributes: [:int_id, :uuid],
       disc_copies: nodes,
       type: :set
-    ])
+    ]) do
+      {:atomic, :ok} -> :ok
+      {:aborted, {:already_exists, _}} -> :ok
+      error -> error
+    end
     :mnesia.wait_for_tables([@id_map_table], 5000)
   end
 
