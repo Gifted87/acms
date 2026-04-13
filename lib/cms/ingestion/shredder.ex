@@ -4,14 +4,14 @@ defmodule CMS.Ingestion.Shredder do
   It balances "too small to have meaning" vs "too big for the embedding vector window".
   """
 
-  @text_target_size 1000
-  @text_overlap_ratio 0.2
-  @code_target_lines 50
+  @text_target_size 3000
+  @text_overlap_ratio 0.1
+  @code_target_lines 150
   @code_overlap_lines 5
 
   @doc """
   Shreds the content into chunks based on the provided strategy.
-  Returns a list of maps: %{content: String.t(), sequence_index: integer(), lines: Range.t() | nil}
+  Returns a list of maps: %{content: String.t(), sequence_index: integer(), lines: %{start: integer(), end: integer()} | nil}
   """
   def shred(content, strategy \\ :text)
 
@@ -85,7 +85,7 @@ defmodule CMS.Ingestion.Shredder do
     total_lines = length(lines)
     
     if total_lines <= @code_target_lines do
-      [%{content: content, sequence_index: 0, lines: 1..total_lines}]
+      [%{content: content, sequence_index: 0, lines: %{start: 1, end: total_lines}}]
     else
       chunk_lines(lines, 0, 0, [])
     end
@@ -101,7 +101,7 @@ defmodule CMS.Ingestion.Shredder do
     if length(potential_chunk) < @code_target_lines do
        chunk_content = Enum.join(potential_chunk, "\n")
        end_line = start_line_idx + length(potential_chunk)
-       new_acc = [%{content: chunk_content, sequence_index: seq_index, lines: (start_line_idx + 1)..end_line} | acc]
+       new_acc = [%{content: chunk_content, sequence_index: seq_index, lines: %{start: start_line_idx + 1, end: end_line}} | acc]
        Enum.reverse(new_acc)
     else
        # We have a full chunk. We need to decide where to cut.
@@ -122,7 +122,7 @@ defmodule CMS.Ingestion.Shredder do
        chunk_content = Enum.join(potential_chunk, "\n")
        end_line = start_line_idx + length(potential_chunk)
        
-       chunk = %{content: chunk_content, sequence_index: seq_index, lines: (start_line_idx + 1)..end_line}
+       chunk = %{content: chunk_content, sequence_index: seq_index, lines: %{start: start_line_idx + 1, end: end_line}}
        
        # Next iteration
        # Overlap: 5 lines.

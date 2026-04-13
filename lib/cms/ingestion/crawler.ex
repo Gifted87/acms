@@ -4,11 +4,13 @@ defmodule CMS.Ingestion.Crawler do
   of the graph hierarchy (Directory -> File Source -> Chunks).
   """
 
-  alias CMS.Ingestion.{MimeGuard, Shredder}
+  alias CMS.Ingestion.MimeGuard
   alias CMS.IngestionEngine
   alias CMS.Edge
   alias CMS.NodeSupervisor
   require Logger
+  
+  @default_ignores [".git", "_build", "deps", ".elixir_ls", "node_modules", ".DS_Store", "priv/data"]
 
   @doc """
   Traverses a directory at the given path and ingests its structure and content.
@@ -18,7 +20,7 @@ defmodule CMS.Ingestion.Crawler do
     cond do
       File.dir?(path) ->
         Logger.info("Crawler: Starting directory traversal at #{path}")
-        traverse_dir(path, nil)
+        traverse_dir(path, nil, path, @default_ignores)
 
       File.exists?(path) ->
         Logger.info("Crawler: Starting single-file ingestion for #{path}")
@@ -30,7 +32,7 @@ defmodule CMS.Ingestion.Crawler do
     end
   end
 
-  defp traverse_dir(path, parent_id) do
+  defp traverse_dir(path, parent_id, root_path, inherited_patterns) do
     dir_name = Path.basename(path)
     
     # 1. Ingest Directory Node
@@ -39,10 +41,17 @@ defmodule CMS.Ingestion.Crawler do
         # 2. List contents
         case File.ls(path) do
           {:ok, files} ->
-            Enum.each(files, fn file ->
+            active_patterns = load_local_patterns(path, inherited_patterns)
+            
+            files
+            |> Enum.reject(fn file -> 
+               full_path = Path.join(path, file)
+               should_ignore?(file, full_path, root_path, active_patterns)
+            end)
+            |> Enum.each(fn file ->
               full_path = Path.join(path, file)
               if File.dir?(full_path) do
-                 traverse_dir(full_path, dir_id)
+                 traverse_dir(full_path, dir_id, root_path, active_patterns)
               else
                  ingest_file(full_path, dir_id)
               end
@@ -99,14 +108,18 @@ defmodule CMS.Ingestion.Crawler do
 
          filename = Path.basename(path)
          
-         # 1. Ingest Source Node
-         payloads = [
-           %CMS.DataBodyPayload.Object{
-             type: :object,
-             object_type: :file_source,
-             data: %{filename: filename, path: path, size: byte_size(content)}
-           }
-         ]
+          # 1. Ingest Source Node with full content
+          payloads = [
+            %CMS.DataBodyPayload.Text{
+              type: :text,
+              content: content
+            },
+            %CMS.DataBodyPayload.Object{
+              type: :object,
+              object_type: :file_source,
+              data: %{filename: filename, path: path, size: byte_size(content)}
+            }
+          ]
          
          provenance = %{source: "CMS.Ingestion.Crawler", type: "file_source", path: path}
          
@@ -130,76 +143,13 @@ defmodule CMS.Ingestion.Crawler do
     end
   end
   
-  defp handle_file_ingestion_success(source_id, parent_id, path, content) do
+  defp handle_file_ingestion_success(source_id, parent_id, _path, _content) do
     link_parent_child(parent_id, source_id)
-    
-    # 2. Shred and Ingest Chunks
-    ext = Path.extname(path)
-    strategy = if ext in ~w(.ex .exs .py .js .ts .rb .c .cpp .h .rs .go .java .cs .php .sh), do: :code, else: :text
-    
-    Logger.info("Shredding #{path} (Strategy: #{strategy})")
-
-    chunks = Shredder.shred(content, strategy)
-    ingest_chunks(chunks, source_id, nil, path)
+    # File content is now stored directly in the file source node
+    # No shredding or chunk creation needed
+    :ok
   end
 
-  defp ingest_chunks([], _source_id, _prev_chunk_id, _path), do: :ok
-  
-  defp ingest_chunks([chunk | rest], source_id, prev_chunk_id, path) do
-    if prev_chunk_id == nil do
-      Logger.info("Ingesting #{length(rest) + 1} chunks for #{path}...")
-    end
-
-    payloads = [
-      %CMS.DataBodyPayload.Text{
-        type: :text,
-        content: chunk.content
-      },
-      %CMS.DataBodyPayload.Object{
-        type: :object,
-        object_type: :chunk_metadata,
-        data: %{sequence_index: chunk.sequence_index, lines: chunk.lines, parent_file: path}
-      }
-    ]
-    
-    # The chunk content itself is the fact
-    fact_text = chunk.content
-    
-    provenance = %{source: "CMS.Ingestion.Crawler", type: "content_chunk", parent: source_id, sequence: chunk.sequence_index}
-    
-    request = %{
-       description_payloads: payloads,
-       fact_text: fact_text,
-       agent_id: "system",
-       acls: %{read: ["public"], write: ["system", "root"]},
-       provenance: provenance
-    }
-    
-    chunk_id_result = 
-      case IngestionEngine.ingest(request) do
-        {:ok, id} -> id
-        {:ok, :ingested_with_conflict_resolution, id} -> id
-        _ -> nil
-      end
-      
-    if chunk_id_result do
-      # Edge: Chunk part_of File
-      add_edge(chunk_id_result, source_id, :part_of, 1.0)
-      
-      # Edge: File contains Chunk (Optional, maybe too noisy? Let's add it for traversal)
-      add_edge(source_id, chunk_id_result, :contains, 1.0)
-      
-      if prev_chunk_id do
-        add_edge(prev_chunk_id, chunk_id_result, :next_part, 1.0)
-        add_edge(chunk_id_result, prev_chunk_id, :prev_part, 1.0)
-      end
-      
-      ingest_chunks(rest, source_id, chunk_id_result, path)
-    else
-      # If chunk failed, try next one?
-      ingest_chunks(rest, source_id, prev_chunk_id, path)
-    end
-  end
 
   defp link_parent_child(nil, _child_id), do: :ok
   defp link_parent_child(parent_id, child_id) do
@@ -225,5 +175,40 @@ defmodule CMS.Ingestion.Crawler do
       pid ->
         GenServer.cast(pid, {:add_edge, edge})
     end
+  end
+
+  defp load_local_patterns(path, inherited_patterns) do
+    ignore_file = Path.join(path, ".cmsignore")
+    patterns = if File.exists?(ignore_file) do
+      Logger.debug("Loading local patterns from #{ignore_file}")
+      File.read!(ignore_file)
+      |> String.split("\n")
+      |> Enum.map(&String.trim/1)
+      |> Enum.reject(&(&1 == "" or String.starts_with?(&1, "#")))
+    else
+      []
+    end
+    
+    all = Enum.uniq(inherited_patterns ++ patterns)
+    Logger.debug("Total active patterns for #{path}: #{inspect(all)}")
+    all
+  end
+
+  defp should_ignore?(name, full_path, root_path, patterns) do
+    rel_path = Path.relative_to(full_path, root_path)
+    
+    res = Enum.any?(patterns, fn pattern ->
+      clean_pattern = String.trim_trailing(pattern, "/")
+      
+      # Match 1: Basename match (e.g. "venv" matches venv/...)
+      # Match 2: Relative path match (e.g. "priv/data" matches priv/data/...)
+      name == clean_pattern or rel_path == clean_pattern
+    end)
+    
+    if res do
+      Logger.debug("IGNORE: #{rel_path} matched a pattern")
+    end
+    
+    res
   end
 end

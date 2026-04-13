@@ -16,7 +16,7 @@ defmodule CMS.MetaNode do
     body = CMS.NodeBody.new(data_head, [payload], data_tail)
 
     {:ok, embedding} = CMS.Tool.Embedder.generate(head_text, "all-MiniLM-L6-v2")
-    head = CMS.NodeHead.new(embedding, "all-MiniLM-L6-v2", 0.99)
+    head = CMS.NodeHead.new(embedding, "all-MiniLM-L6-v2", 0.95)
 
     provenance = %{source: "CMS.IngestionEngine", method: "dialectical_merge"}
     Node.new(head, body, provenance)

@@ -49,6 +49,15 @@ defmodule CMS.Application do
     ]
 
     opts = [strategy: :one_for_one, name: CMS.Supervisor]
-    Supervisor.start_link(children, opts)
+    case Supervisor.start_link(children, opts) do
+      {:ok, pid} ->
+        # 7. Post-Boot Hydration
+        # Spawns node processes from epoch logs.
+        CMS.Recovery.Hydrator.run()
+        {:ok, pid}
+
+      error -> 
+        error
+    end
   end
 end

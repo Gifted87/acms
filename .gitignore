@@ -1,20 +1,29 @@
-```
 # Elixir specific
 *.beam
 *.ez
-ebin/
-_build/
-cover/
+**/ebin/
+**/_build/
+**/cover/
 .erlang.cookie
+.elixir_ls/
 
 # Dependencies
 deps/
 node_modules/
+venv/
+__pycache__/
+*.pyc
 
 # Environment variables
 .env
 .env.local
 *.env.*
+
+# Application Data & Cartesian Shells
+**/priv/data/
+**/memory_cartridges/
+priv/data/
+memory_cartridges/
 
 # Logs
 *.log
@@ -34,4 +43,3 @@ test/fixtures/
 # OS
 .DS_Store
 Thumbs.db
-```

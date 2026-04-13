@@ -35,12 +35,22 @@ port = String.to_integer(System.get_env("ACMS_PORT") || "4000")
 # 4. Capture Node Name (Informational for logic, actual node name set by vm.args if release)
 node_name = System.get_env("ACMS_NODE_NAME") || "cms"
 
-# 5. Security (Session Secret)
+# 5. Security (Secrets & Tokens)
 secret_key = System.get_env("ACMS_SECRET") || Base.encode64(:crypto.strong_rand_bytes(32))
+admin_token = System.get_env("ACMS_ADMIN_TOKEN") || "admin_secret"
 
-# 6. Apply Configuration to Application Environment
+# 6. Gemini AI Configuration (Google Vertex AI)
+gemini_api_key = System.get_env("GEMINI_API_KEY")
+gemini_model = System.get_env("GEMINI_MODEL") || "gemini-2.5-flash-lite"
+gemini_endpoint = System.get_env("GEMINI_API_ENDPOINT") || "https://generativelanguage.googleapis.com/v1beta/models"
+
+# 7. Apply Configuration to Application Environment
 config :acn_cms,
   data_root: data_dir,
   node_name: node_name,
   web_port: port,
-  secret_key: secret_key
+  secret_key: secret_key,
+  admin_token: admin_token,
+  gemini_api_key: gemini_api_key,
+  gemini_model: gemini_model,
+  gemini_endpoint: gemini_endpoint

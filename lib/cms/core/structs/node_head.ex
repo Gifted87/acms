@@ -31,7 +31,7 @@ defmodule CMS.NodeHead do
   Creates a new NodeHead with default metabolic energy.
   """
   @spec new(Nx.Tensor.t(), String.t(), float()) :: t()
-  def new(embedding, model_version, threshold \\ 0.35) do
+  def new(embedding, model_version, threshold \\ 0.3) do
     %__MODULE__{
       embedding: embedding,
       embedding_model_version: model_version,

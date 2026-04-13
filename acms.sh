@@ -1,53 +1,48 @@
 #!/bin/bash
+# ------------------------------------------------------------------------------
+# ACMS Portability Loader (Interactive Mode)
+# ------------------------------------------------------------------------------
 
-# ACMS Easy-Spin Script
-# Usage: ./acms.sh [PORT] [INSTANCE_NAME]
-# Example: ./acms.sh 4001 finance
-
-# 1. Parse Arguments (Defaults: Port 4000, Name "default")
-PORT=${1:-4000}
-NAME=${2:-default}
-
-# 2. Define Data Directory
-# We store data in a "memory_cartridges" folder in the project root for organization,
-# but strictly separated by instance name.
-DATA_ROOT="./memory_cartridges"
-INSTANCE_DATA_DIR="${DATA_ROOT}/${NAME}"
-
-# 3. Export Environment Variables for ACMS (runtime.exs picks these up)
-export ACMS_PORT=$PORT
-export ACMS_NODE_NAME=$NAME
-export ACMS_DATA_DIR=$INSTANCE_DATA_DIR
-
-# 4. Generate a runtime secret if one isn't set (prevents session hijacking between restarts)
-# Note: In production persistence, you might want this to be static, but for
-# dynamic ephemeral spin-ups, a random secret is safer than a hardcoded one.
-if [ -z "$ACMS_SECRET" ]; then
-    export ACMS_SECRET=$(openssl rand -base64 32)
+# 1. Parameter Resolution (Swap handled: If $1 is a number, assume it's the port)
+if [[ "$1" =~ ^[0-9]+$ ]]; then
+    PORT="$1"
+    NAME="${2:-cms}"
+else
+    NAME="${1:-cms}"
+    PORT="${2:-4000}"
 fi
 
-# 5. UI Feedback
+export ACMS_NODE_NAME="$NAME"
+export ACMS_PORT="$PORT"
+
+# 2. Data Directory Resolution
+if [ -z "$ACMS_DATA_DIR" ]; then
+    export ACMS_DATA_DIR="$(pwd)/memory_cartridges/${NAME}"
+else
+    echo "[ACMS] Manual cartridge detected at: $ACMS_DATA_DIR"
+fi
+
+mkdir -p "$ACMS_DATA_DIR"
+
+# 3. Environment Setup
+export REPLACE_OS_VARS=true
+export MIX_ENV=dev
+
+# 4. Identity Construction (THIS WAS MISSING/BROKEN)
+# We bind ONLY to loopback to prevent accidental cluster meshes on public LANs
+NODE_ID="${NAME}@127.0.0.1"
+
 echo "=================================================="
 echo "          ACMS: INSTANCE LAUNCHER                 "
 echo "=================================================="
-echo "   Instance Name : $NAME"
-echo "   Port          : $PORT"
-echo "   Memory Path   : $INSTANCE_DATA_DIR"
-echo "   OS PID        : $$"
+echo " Instance Name : $NAME"
+echo " Port          : $PORT"
+echo " Node ID       : $NODE_ID"
+echo " Memory Path   : $ACMS_DATA_DIR"
 echo "=================================================="
 
-# 6. Ensure Data Directory Exists
-mkdir -p "$INSTANCE_DATA_DIR"
-
-# 7. Boot the Server
-# We use --name to ensure the Erlang Node has a unique identity.
-# This is critical for Mnesia if we ever network them.
-# We map 'localhost' assuming local usage.
-CMD="elixir --name ${NAME}@127.0.0.1 -S mix phx.server"
-
-echo "Running: $CMD"
-print_line() { printf "%0.s-" {1..50}; echo; }
-print_line
-
-# Exec replaces the shell process, handling signals correctly
-exec $CMD
+# 5. Boot Sequence (Interactive)
+# Using 'iex' so it stays alive and gives you a shell
+# Cookie is used for secure node-to-node communication
+COOKIE="${ACMS_COOKIE:-secure_cognitive_cookie}"
+iex --name "$NODE_ID" --cookie "$COOKIE" -S mix

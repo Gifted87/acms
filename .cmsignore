@@ -1,0 +1,22 @@
+# CMS Ingestion Ignore File
+# Patterns listed here will be skipped during folder ingestion.
+
+# Default system/build folders
+.git
+_build
+deps
+.elixir_ls
+node_modules
+.DS_Store
+
+# Project-specific exclusions
+priv/data
+venv
+venv311
+native 
+__pycache__
+compiled_codebase.txt
+
+# Temporary/Verification files
+verify_ignore
+verification_test.exs

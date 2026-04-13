@@ -40,11 +40,11 @@ defmodule CMS.Web do
       # 2. Define the dispatch table
       # Plug.Cowboy will do it automatically. Passing a compiled table causes the crash.
       dispatch = [
-        {:_, [
-          {ws_route, CMS.Web.SocketHandler, []},
-          {:_, Plug.Cowboy.Handler, {CMS.Web.Router, []}}
-        ]}
-      ]
+  {:_, [
+    {ws_route, CMS.Web.SocketHandler, %{}}, # Change [] to %{}
+    {:_, Plug.Cowboy.Handler, {CMS.Web.Router, []}}
+  ]}
+]
 
       children = [
         # Pass the raw list 'dispatch' to options
@@ -158,6 +158,17 @@ defmodule CMS.Web.Router do
          end
       _ ->
          send_json(conn, 400, %{error: "No file provided"})
+    end
+  end
+
+  post "/api/v1/ingest/path" do
+    path = conn.body_params["path"]
+    if path && File.exists?(path) do
+      # This triggers the Crawler.crawl(path) via the Orchestrator
+      CMS.Ingestion.Orchestrator.start_ingestion(path)
+      send_json(conn, 202, %{status: "accepted", path: path})
+    else
+      send_json(conn, 400, %{error: "Path invalid or not found on server"})
     end
   end
 
@@ -601,7 +612,8 @@ defmodule CMS.Web.SocketHandler do
   def init(req, state) do
     qs = :cowboy_req.parse_qs(req)
     token = :proplists.get_value("token", qs)
-    permissions = if token == "admin_secret", do: :admin, else: :public
+    expected_token = Application.get_env(:acn_cms, :admin_token)
+    permissions = if token == expected_token, do: :admin, else: :public
     {:cowboy_websocket, req, Map.put(state, :permissions, permissions)}
   end
 

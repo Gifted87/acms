@@ -21,8 +21,8 @@ defmodule CMS.IngestionEngine do
 
   # Configuration
   @max_associative_links 10       # Max number of non-conflict links to prime
-  @min_associative_score 0.3    # Threshold for Hebbian Priming
-  @conflict_similarity_threshold 0.8
+  @min_associative_score 0.4    # Threshold for Hebbian Priming
+  @conflict_similarity_threshold 0.85
   @trust_supersede_threshold 0.2 # If new node is > 0.2 more trusted, it wins.
 
   # Scatter-Gather Configuration

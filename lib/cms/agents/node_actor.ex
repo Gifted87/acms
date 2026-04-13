@@ -450,10 +450,10 @@ defmodule CMS.NodeActor do
   defp rules do
     [
       {:critical_fact_alert, fn node, _context, score ->
-        score > 0.95 and String.contains?(node.body.data_head.fact, "CRITICAL")
+        score > 0.85 and String.contains?(node.body.data_head.fact, "CRITICAL")
       end},
       {:untrusted_agent_high_score, fn _node, context, score ->
-        score > 0.90 and Map.get(context, :agent_trust_level, 1.0) < 0.5
+        score > 0.80 and Map.get(context, :agent_trust_level, 1.0) < 0.3
       end},
       {:emergency_mode_activation, fn _node, context, _score ->
         Map.get(context, :system_mode) == :emergency

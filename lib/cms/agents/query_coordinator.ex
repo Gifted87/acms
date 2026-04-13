@@ -18,7 +18,7 @@ defmodule CMS.QueryCoordinator do
   @top_k_results 50             # Only care about top 50 relevant nodes
   @inhibit_threshold_count 100  # If >100 nodes fire, trigger inhibition
   @query_timeout 10_000         # Max time to wait if NO results arrive
-  @gathering_window 50          # NEW: Once first result arrives, wait only 50ms for others, then return.
+  @gathering_window 5000          # NEW: Once first result arrives, wait only 50ms for others, then return.
   @inhibit_check_delay 150      # Check for explosion 150ms after start
 
   # State
