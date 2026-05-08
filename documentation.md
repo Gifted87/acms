@@ -8,16 +8,16 @@
 3. [Infrastructure: The Supervision Tree](#3-infrastructure-the-supervision-tree)
 4. [Anatomy of Cognition (Data Structures)](#4-anatomy-of-cognition-data-structures)
 5. [Recall: Spreading Activation & Search](#5-recall-spreading-activation--search)
-6. [Neuroplasticity: The Learning Loop](#7-neuroplasticity-the-learning-loop)
-7. [Sovereignty: Persistence & Recovery](#8-sovereignty-persistence--recovery)
-8. [Time Travel: Temporal Query Engine](#9-time-travel-temporal-query-engine)
-9. [Security & Access Control](#10-security--access-control)
-10. [The Frontal Cortex: ML Bridge](#11-the-frontal-cortex-ml-bridge)
-11. [Universal API Reference](#12-universal-api-reference)
-12. [Observability & Agent Integration](#13-observability--agent-integration)
-13. [Testing & Maintenance](#14-testing--maintenance)
-14. [Configuration & Tuning](#15-configuration--tuning)
-15. [Getting Started Guide](#16-getting-started-guide)
+6. [Neuroplasticity: The Learning Loop](#6-neuroplasticity-the-learning-loop)
+7. [Sovereignty: Persistence & Recovery](#7-sovereignty-persistence--recovery)
+8. [Time Travel: Temporal Query Engine](#8-time-travel-temporal-query-engine)
+9. [Security & Access Control](#9-security--access-control)
+10. [The Frontal Cortex: ML Bridge](#10-the-frontal-cortex-ml-bridge)
+11. [Universal API Reference](#11-universal-api-reference)
+12. [Observability & Agent Integration](#12-observability--agent-integration)
+13. [Testing & Maintenance](#13-testing--maintenance)
+14. [Configuration & Tuning](#14-configuration--tuning)
+15. [Getting Started Guide](#15-getting-started-guide)
 
 # 1. Introduction: Paradigm Shift
 
@@ -75,8 +75,6 @@ The choice of Elixir and the Erlang/OTP (Open Telecom Platform) was not accident
 - **Fault Tolerance**: In a brain, if a single neuron fails, the system doesn't crash. Erlang's "Let it Crash" philosophy and supervision trees provide the exact same level of resilience.
 - **Distributed by Nature**: The BEAM was designed for distributed systems. ACMS can naturally scale from a single core to a thousand nodes across a global network without changing its fundamental logic.
 
-### Deep Technical Context Section
-The technical underpinnings of the ACMS system rely on the unique capabilities of the Erlang VM (BEAM). Unlike traditional runtimes, the BEAM treats concurrency as a first-class citizen. Each NodeActor in ACMS is mapped to an Erlang process, which has its own heap and stack. This isolation is critical for the 'Cellular Security' model discussed in Chapter 10. When a query is broadcast across the Cognitive Bus, the BEAM's scheduler efficiently manages the execution of thousands of firing nodes in parallel, utilizing all available CPU cores without the need for complex locking mechanisms. This architecture allows ACMS to achieve microsecond latency in spreading activation pulses, even when the cortex contains millions of active nodes. Furthermore, the BEAM's preemptive scheduler ensures that no single node can monopolize the system's resources, maintaining global homeostasis even during massive 'Signal Storms.'
 
 ---
 
@@ -132,8 +130,6 @@ Neurons require energy to fire. In ACMS, "Energy" is mapped to system resources 
 
 Just as the human brain consolidates memories during sleep, ACMS performs **Offline Consolidation**. During periods of low query load, the system's background workers (like the `DecayManager` and `ModelDriftManager`) audit the graph. They prune weak links, re-index new associations, and optimize the vector space. This ensures that the system is always "Waking Up" sharper and more organized than it was the day before.
 
-### Neurobiological Implementation Details
-The mapping from neurobiology to digital logic in ACMS is achieved through a set of sophisticated algorithms that balance semantic precision with associative recall. The Hebbian Learning engine, for example, utilizes a modified version of the Hebbian Rule that incorporates a temporal decay factor. This ensures that only the most consistently useful associations are maintained, mirroring the way the human brain prunes synapses that are no longer active. The Firing Threshold is dynamically adjusted based on the system's overall 'Excitation Level,' a metric that tracks the rate of message passing across the Cognitive Bus. In high-stress scenarios, the system automatically increases the threshold to prioritize only the most semantically relevant memories, preventing the cognitive overload that can occur in less sophisticated RAG systems. This homeostatic balance is the key to ACMS's ability to provide coherent, high-value recall even in the presence of massive amounts of noisy, unstructured data.
 
 ---
 
@@ -178,8 +174,6 @@ The `NodeSupervisor` is a `DynamicSupervisor` responsible for the birth and deat
 - **On-Demand Activation**: Nodes are not all loaded into memory on startup. They are "Woken Up" by the `Hydrator` the first time they are queried.
 - **Self-Healing**: If a `NodeActor` becomes corrupted, the Supervisor restarts it. If the restart fails, the node is "Blacklisted" and a rehydration request is sent.
 
-### Infrastructure Technical Deep Dive
-The supervision tree in ACMS is designed to maximize availability while minimizing recovery time. The use of a DynamicSupervisor for NodeActors allows the system to manage its memory footprint dynamically, spawning and killing processes as needed based on the current cognitive load. This is complemented by the Registry module, which provides a highly efficient, core-local lookup table for process PIDs. Unlike global process names, which can become a bottleneck in large clusters, the Registry is partitioned across CPU cores, allowing for millions of concurrent lookups with minimal contention. The LogAppender's batching logic further enhances performance by grouping disk writes, reducing the I/O overhead on the underlying filesystem. This combination of actor-based concurrency, distributed state management via Mnesia, and optimized persistence makes ACMS the most robust cognitive memory engine ever built on the BEAM virtual machine.
 
 ---
 
@@ -224,8 +218,6 @@ The `Edge` is the connective tissue of the system. It implements **Explicit Link
 - **`:contradicts`**: Logical conflict between two facts.
 - **`:supersedes`**: Temporal versioning (Fact A is newer than Fact B).
 
-### Data Structure Technical Deep Dive
-The efficiency of ACMS relies on the careful design of its core structs. By using Elixir's defstruct, we ensure that every node and edge has a predictable memory layout, which is critical for the BEAM's garbage collector and for the serialization process used in the Chrono-Stack. The use of SHA-256 for node IDs not only provides content-addressability but also serves as a robust mechanism for de-duplication across distributed instances. The polymorphic nature of the DataBody is achieved through a set of specialized payload structs, each optimized for its specific data type. For example, the Code payload includes metadata for language detection and indentation-aware shredding, while the Object payload provides native support for nested JSON maps. This granularity allows ACMS to act as a universal memory engine, capable of storing and associating any form of digital information with perfect fidelity.
 
 ---
 
@@ -257,8 +249,6 @@ Firing nodes excite their neighbors via shared edges.
 The `ActivationEngine` acts as the "Inhibitory System."
 - **Global Inhibition**: If the system detects a "Signal Storm," it broadcasts an inhibition signal that raises the firing threshold for all nodes.
 
-### Recall Technical Deep Dive
-The recall mechanism in ACMS is designed to mimic the spreading activation patterns observed in the human brain. By using a decentralized PubSub-based architecture, the system eliminates the bottlenecks associated with centralized vector indices. Every NodeActor is responsible for its own firing decision, allowing the system to scale horizontally to millions of nodes across a cluster of servers. The QueryCoordinator acts as the 'Short-Term Memory' for each query, collecting and ranking firing events in real-time. The use of a damping factor and TTL for pulse propagation ensures that the system remains focused and prevents the chaotic signal storms that can occur in unstructured graphs. This combination of semantic vector matching and associative link following allows ACMS to discover hidden connections and provide a level of context that is simply not possible with traditional search engines.
 
 ---
 
@@ -284,8 +274,6 @@ Associations that are not used slowly decay.
 As ML models evolve, the vector embeddings for old nodes may become obsolete.
 - **Re-Vectorization**: The `ModelDriftManager` periodically re-embeds nodes using the latest model in the ML Bridge.
 
-### Learning Technical Deep Dive
-The learning loop in ACMS is a continuous process that optimizes the cortex for the specific needs of the user. The HebbianEngine implements a high-performance weight update algorithm that uses Mnesia transactions to ensure the integrity of the graph topology. The DecayManager operates as a background worker, periodically auditing the entire graph to prune weak and unused links. This 'Active Forgetting' is critical for maintaining system performance, as it prevents the cortex from being overwhelmed by obsolete or low-value information. The ModelDriftManager ensures that the system's semantic understanding remains current, automatically re-indexing nodes whenever a new search model is deployed. This combination of real-time reinforcement and background optimization allows ACMS to grow and adapt with a sophistication that mirrors the neuroplasticity of the human brain.
 
 ---
 
@@ -313,8 +301,6 @@ The `Hydrator` reconstructs the system's state from the Chrono-Stack.
 3.  **State Reconstruction**: Re-spawns `NodeActors` and re-establishes edges.
 4.  **Vector Index Rebuild**: Re-indexes all nodes into the HNSW graph.
 
-### Persistence Technical Deep Dive
-The persistence layer in ACMS is designed to ensure maximum sovereignty and portability for the user's data. By using an immutable, event-sourced Chrono-Stack, we guarantee that the system's state can be fully reconstructed from a portable Memory Cartridge, independent of any external database provider. The LogAppender's batching logic and backpressure mechanisms ensure that the system can handle massive event rates without sacrificing write integrity. The InstanceGuard provides a critical safety layer, preventing data corruption that could occur if two instances attempted to mount the same cartridge simultaneously. This robust storage architecture makes ACMS the ideal solution for sovereign AI applications that require long-term, verifiable memory across heterogeneous hardware environments.
 
 ---
 
@@ -337,8 +323,6 @@ State in ACMS is often nested.
 
 Temporal queries allow for auditing of AI decision-making by revealing exactly what "Facts" the system had access to at any given moment.
 
-### Temporal Query Technical Deep Dive
-The Temporal Query Engine is one of the most unique features of ACMS, providing a level of explainability and auditability that is simply not possible with traditional vector databases. By replaying the immutable Chrono-Stack, the engine can recreate the exact 'state of mind' of the system at any point in time. This is achieved through a high-performance replay mechanism that leverages the speed of the BEAM's pattern matching and recursion. The deep_merge_recursive utility ensures that nested state updates are correctly applied, allowing the system to track the evolution of complex configuration objects or semantic associations over time. This 'Time Travel' capability is essential for debugging cognitive drift, auditing AI behavior, and ensuring long-term alignment with the user's goals.
 
 ---
 
@@ -362,8 +346,6 @@ Every event is tagged with **Provenance Metadata**.
 
 Nodes broadcast a "Pain Signal" on the Cognitive Bus if they detect unauthorized access attempts or unexpected state changes.
 
-### Security Technical Deep Dive
-The cellular security model in ACMS treats every piece of information as a sovereign entity. By decentralizing security enforcement at the node level, we eliminate the 'Single Point of Failure' inherent in centralized ACL systems. Every NodeActor acts as its own gatekeeper, validating every query against its internal permission set. This architecture is ideally suited for multi-tenant or multi-agent environments where different entities may have different levels of access to the shared cortex. The use of provenance metadata ensures that every change is traceable back to its source, providing a perfect chain of trust for the system's knowledge. The abnormality signaling mechanism provides real-time observability into security events, allowing for immediate intervention if the system's integrity is compromised.
 
 ---
 
@@ -382,21 +364,19 @@ The heavy lifting of semantic understanding is handled by the **ML Bridge** (Pyt
 - **Anchor Vectors**: Text is compared against "Semantic Anchors" to calculate salience.
 - **Distance Calculation**: Uses Cosine Similarity for distance measurement.
 
-### ML Bridge Technical Deep Dive
-The ML Bridge serves as the primary interface between the Elixir-based cognitive orchestration and the Python-based machine learning ecosystem. By using FastAPI, we achieve high-performance asynchronous connectivity between the two runtimes. The bridge's transformer pipelines are optimized for the specific requirements of associative memory, prioritizing fast vector generation and accurate semantic similarity scoring. The use of hardware acceleration (CUDA/MPS) ensures that the system can handle massive ingestion and recall loads with microsecond latency. The cognitive salience mathematics provide a robust way to filter and rank incoming information, ensuring that only the most relevant facts are integrated into the cortex. This hybrid architecture allows ACMS to leverage the best-in-class tools from both the Elixir and Python ecosystems, resulting in a cognitive memory engine that is both fast and semantically aware.
 
 ---
 
 # 11. Universal API Reference
 
-ACMS exposes a unified interface via HTTP/REST and WebSockets. All requests must include the `x-agent-id` header for provenance and security tracking.
+The ACMS provides a unified REST and WebSocket interface for all cognitive operations.
 
-## 11.1. Ingestion Protocol
+## 11.1. Knowledge Ingestion
 
-### 11.1.1. Sovereign Ingestion
+### 11.1.1. Standard Ingest
 `POST /api/v1/ingest`
 
-The primary method for populating the cortex. This endpoint accepts a fully structured payload, allowing the caller to define the fact, its evidential payloads, and its cellular security policies.
+The primary method for adding discrete facts to the cortex.
 
 **Request Body:**
 ```json
@@ -409,77 +389,80 @@ The primary method for populating the cortex. This endpoint accepts a fully stru
       "content": "Detailed evidence for the fact."
     }
   ],
-  "acls": ["public"]
+  "acls": {
+    "read": ["public"],
+    "write": ["system"]
+  },
+  "provenance": {
+    "source": "manual_entry",
+    "priority": "high"
+  }
 }
 ```
 
-**Example Curl:**
-```bash
-curl -X POST http://localhost:4000/api/v1/ingest \
-     -H "Content-Type: application/json" \
-     -H "x-agent-id: root" \
-     -d '{
-       "fact_text": "Digital Organisms learn through association.",
-       "agent_id": "genesis_machine",
-       "description_payloads": [{"type": "text", "content": "Evidence block."}]
-     }'
-```
+### 11.1.2. Asynchronous Ingestion Patterns
+- **Blob Ingest**: `POST /api/v1/ingest/blob` (Ingests a raw text blob as a temporary file).
+- **File Upload**: `POST /api/v1/ingest/upload` (Supports multipart file uploads, including `.zip` archives).
+- **Path Crawl**: `POST /api/v1/ingest/path` (Instructs the server to crawl a local filesystem path).
 
-## 11.2. Query & Cognitive Search
+## 11.2. Cognitive Search & Time Travel
 
 `POST /api/v1/query`
 
-The primary interface for stimulating the cortex. Supports semantic search, associative pulses, and temporal rehydration.
+The interface for stimulating the cortex. Supports live associative search and historical "Time Travel."
 
-**Request Parameters:**
+**Parameters:**
 | Parameter | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `query_text` | String | Required* | The natural language query. |
-| `min_relevance` | Float | 0.6 | Similarity threshold (0.0 to 1.0). |
-| `max_results` | Integer | 50 | Maximum nodes to return. |
-| `as_of` | String | `null` | ISO8601 timestamp for temporal search. |
-| `reasoning_mode` | String | `normal` | `normal`, `brainstorm` (high pulse), `precision` (low pulse). |
+| `query_text` | String | null* | Natural language query. |
+| `query_vector` | List[Float] | null* | Pre-computed vector (skips embedding step). |
+| `min_relevance` | Float | 0.6 | Similarity threshold. |
+| `reasoning_mode` | String | `normal` | `normal`, `brainstorm` (high pulse), `precision`. |
+| `as_of` | String | null | ISO8601 timestamp for **Historical Search**. |
+| `max_results` | Integer | 50 | Limit results. |
 
-**Example Search:**
+**Historical "Time Travel" Example:**
 ```bash
 curl -X POST http://localhost:4000/api/v1/query \
-     -H "Content-Type: application/json" \
-     -d '{
-       "query_text": "Who built the ACMS?",
-       "min_relevance": 0.7,
-       "max_results": 5
-     }'
+  -H "Content-Type: application/json" \
+  -d '{
+    "query_text": "What was the system state regarding authentication?",
+    "as_of": "2024-12-01T12:00:00Z"
+  }'
 ```
 
-**Temporal "Time Travel" Example:**
-```bash
-curl -X POST http://localhost:4000/api/v1/query \
-     -H "Content-Type: application/json" \
-     -d '{
-       "query_text": "System state",
-       "as_of": "2024-12-01T12:00:00Z"
-     }'
-```
-
-## 11.3. Node Interaction & Feedback
+## 11.3. Node Interaction & Forensic Fetch
 
 ### 11.3.1. Fetch Node State
 `GET /api/v1/nodes/:id`
+Returns the current active state (or latest historical state) of a specific node.
 
-### 11.3.2. Anti-Hebbian Feedback (Penalization)
+### 11.3.2. Fetch Synaptic Edges
+`GET /api/v1/nodes/:id/edges`
+Returns all associative relationships (synapses) connected to the node.
+
+### 11.3.3. Node History (Time Travel)
+`GET /api/v1/nodes/:id/history?as_of=TIMESTAMP`
+Fetches the state of a specific node at a precise moment in the past.
+
+### 11.3.4. Anti-Hebbian Feedback
 `POST /api/v1/nodes/:id/feedback`
+Allows agents to penalize a node if its retrieval was irrelevant.
 
-Used to manually weaken associations if a node is deemed irrelevant to a specific context.
+## 11.4. System Administration & Health
 
-**Example Request:**
-```json
-{
-  "penalization_amount": 0.2,
-  "context_id": "query_abc_123"
-}
-```
+### 11.4.1. Embedder Health
+`GET /api/v1/health/embedder`
+Verifies the connection to the ML Bridge.
 
-## 11.4. Real-Time Signals (WebSockets)
+### 11.4.2. Admin Actions
+`POST /api/v1/system/:action`
+Requires `x-agent-id: root` or `system`.
+- **`rotate-epoch`**: Forces a rotation of the Chrono-Stack log files.
+- **`check-drift`**: Initiates a semantic drift analysis across all nodes.
+- **`set-congestion`**: Manually sets the system congestion level (0.0 to 1.0).
+
+## 11.5. Real-Time Signals (WebSockets)
 
 `WS /api/v1/events?token=YOUR_ADMIN_TOKEN`
 
@@ -496,11 +479,6 @@ Used to manually weaken associations if a node is deemed irrelevant to a specifi
 }
 ```
 
-### API Technical Deep Dive
-The Universal API Reference provides everything needed for an external agent or application to interact with the ACMS cortex. The RESTful endpoints are designed for high-performance ingestion and query coordination, while the WebSocket interface provides real-time observability into the system's internal state. Every API call is validated through the security mechanisms discussed in Chapter 10, ensuring that only authorized entities can interact with the memory. The use of JSON for all message payloads ensures compatibility across all modern programming languages. For high-throughput applications, the WebSocket interface is particularly powerful, allowing for a tight feedback loop between the system's learning and the external environment.
-
----
-
 # 12. Observability & Agent Integration
 
 ## 12.1. LiveMonitor (Watching the Brain)
@@ -515,8 +493,6 @@ ACMS is designed for **Memory-Augmented Generation (MAG)**.
 - **Rich Context**: Agents use the associative graph to build contexts that exceed the limits of traditional RAG.
 - **Obsidian Integration**: Exporting cognitive traces to Obsidian for human review.
 
-### Observability Technical Deep Dive
-The observability suite in ACMS provides a transparent view into the inner workings of the digital mind. By subscribing to the 'global:signals' topic, the LiveMonitor tool can visualize the real-time spread of activation across the cortex, allowing developers to see exactly how associations are being followed during a query. This level of transparency is critical for debugging complex cognitive behaviors and ensuring that the system is learning the right things. The agent integration patterns (MAG) provide a blueprint for how to use ACMS to enhance the reasoning capabilities of LLMs. By providing a rich, associative context that goes far beyond simple semantic search, MAG allows agents to perform deeper analysis and maintain better long-term consistency in their outputs. The Obsidian integration further bridges the gap between human and machine cognition, allowing users to interact with and review the system's associations in a familiar, human-friendly format.
 
 ---
 
@@ -542,97 +518,194 @@ Measuring latency and throughput for spreading activation at scale.
 - **Multimodal Synapses**: Linking text to images and audio.
 - **Autonomous Dreaming**: Offline consolidation and pruning cycles.
 
-### Testing and Maintenance Technical Deep Dive
-The testing and maintenance protocols for ACMS ensure that the system remains stable and reliable as it grows to millions of nodes. By leveraging Elixir's built-in ExUnit framework, we maintain a robust suite of unit and integration tests that verify the correctness of every core component. The chaos engineering experiments involve deliberately terminating NodeActor processes and ensuring that the Hydrator can perfectly reconstruct their state from the immutable Chrono-Stack. Performance benchmarking is a continuous process, measuring the latency of spreading activation pulses and the throughput of the ingestion pipeline across different hardware configurations. The roadmap for ACMS focuses on scaling the system to distributed clusters and expanding its semantic range to multimodal data. This rigorous approach to quality assurance and forward-looking architecture ensures that ACMS remains the gold standard for sovereign, associative cognitive memory systems.
 
 ---
 
 # 14. Configuration & Tuning
 
-ACMS is highly configurable via environment variables and the `config/` directory.
+The ACMS is designed to be highly adaptable. Configuration is primarily handled through environment variables (for system-level settings) and internal parameters (for cognitive mechanics).
 
-## 14.1. Core Environment Variables
+## 14.1. System Environment Variables
+
+These variables are resolved at runtime in `config/runtime.exs`.
 
 | Variable | Default | Description |
 | :--- | :--- | :--- |
 | `ACMS_PORT` | `4000` | HTTP/WS API Port. |
-| `ACMS_ADMIN_TOKEN` | `admin_secret` | Token for admin APIs and WebSocket auth. |
-| `ACMS_DATA_DIR` | `./memory_cartridges` | Location of the Chrono-Stack and Mnesia logs. |
-| `GEMINI_API_KEY` | `null` | Required for semantic embedding and reasoning. |
-| `ACMS_COOKIE` | `secure_cookie` | Erlang distribution cookie for clustering. |
+| `ACMS_DATA_DIR` | `./priv/data` | Location of the "Memory Cartridge" (Chrono-Stack and Mnesia logs). |
+| `ACMS_NODE_NAME` | `cms` | Human-readable name for the brain node in the network. |
+| `ACMS_ADMIN_TOKEN` | `admin_secret` | Token for admin APIs and WebSocket authentication. |
+| `ACMS_SECRET` | (Auto-generated) | Base64 secret for session/auth signing. Highly recommended to set this in production. |
+| `ACMS_COOKIE` | `secure_cookie` | Erlang distribution cookie for multi-node clustering. |
 
-## 14.2. Cognitive Thresholds
+## 14.2. Cognitive Thresholds & Mechanics
 
-These values are typically set in `config/config.exs` or via system API calls.
+These parameters define how the "Cortex" behaves during query stimulation and spreading activation.
 
-- **`min_relevance` (0.6)**: The minimum semantic similarity required for a node to "fire."
-- **`pulse_damping` (0.3)**: The reduction in energy as a signal passes through a synapse.
-- **`max_hops` (2)**: Maximum distance a signal can travel from the primary firing node.
-- **`inhibition_threshold` (1000)**: Number of concurrent firings before Global Inhibition (GABA) is triggered.
+### 14.2.1. Retrieval Parameters
+- **`min_relevance` (Default: 0.6)**: The minimum semantic similarity required for a node to "fire" during a query. This can be overridden per request in the API.
+- **`max_results` (Default: 50)**: The maximum number of nodes returned by a query.
 
-## 14.3. Persistence Tuning
+### 14.2.2. Spreading Activation Tuning
+- **Synaptic Resistance (0.3)**: A damping factor applied as a signal passes through a synapse. This ensures associative links act as "contextual whispers" rather than "shouts," preventing highly-connected "Hub Nodes" from overpowering direct hits.
+- **Max Hops (2)**: The maximum distance a signal can travel from the primary firing node. This is controlled by the initial TTL (Time-To-Live) of 2 assigned to primary pulses.
+- **Global Inhibition Factor**: A dynamic multiplier (1.0 to 0.1) managed by the `ActivationEngine`. During high system congestion, this factor is lowered to dampen spreading activation and reduce computational load.
 
-- **`flush_interval_ms` (100)**: How often the `LogAppender` writes to disk.
-- **`batch_size` (1000)**: Number of events collected before a forced flush.
+## 14.3. Persistence & Infrastructure Tuning
+
+### 14.3.1. LogAppender (Chrono-Stack)
+The `LogAppender` manages the high-throughput, append-only ledger of all cognitive events.
+- **`flush_interval` (1000ms)**: How often the in-memory buffer is written to the physical disk.
+- **`buffer_size` (50 items)**: The number of events collected before a forced flush to disk occurs, regardless of the interval.
+
+### 14.3.2. ML Bridge (Python)
+The ML Bridge handles the heavy lifting of generating vector embeddings and importance (salience) scoring.
+- **Model**: `all-MiniLM-L6-v2` (Configurable in `ml_bridge.py`).
+- **Port**: `5000`.
+- **Salience Anchors**: The bridge uses a set of pre-defined "anchor texts" (e.g., "Critical system failure") to calculate the semantic importance of incoming facts.
 
 ---
 
 # 15. Getting Started Guide
 
-## 15.1. Prerequisites
-- **Erlang/OTP 26+** and **Elixir 1.15+**.
-- **Python 3.10+** (for the ML Bridge).
-- **PostgreSQL/Mnesia** (Mnesia is built-in).
+This section provides a clear, step-by-step guide to installing the ACMS and connecting your agents to the memory network via the API.
 
-## 15.2. Installation
+## 15.1. Installation and Setup
 
-1. **Clone and Install Dependencies**:
-   ```bash
-   git clone https://github.com/GiftBraimah/acms.git
-   cd acms
-   mix deps.get
-   ```
+### 1. Clone and Navigate
+First, clone the repository and navigate into the project directory:
 
-2. **Setup the ML Bridge**:
-   ```bash
-   pip install -r requirements.txt
-   python3 ml_bridge.py
-   ```
+```bash
+git clone https://github.com/Gifted87/acms.git
+cd acms
+```
 
-3. **Configure Environment**:
-   ```bash
-   cp .env.example .env
-   # Edit .env with your GEMINI_API_KEY
-   source .env
-   ```
+### 2. Install System Dependencies
+Install the necessary dependencies for Elixir, Erlang, and Python. Open your terminal and run the following commands:
 
-4. **Boot the Genesis Machine**:
-   ```bash
-   mix phx.server
-   ```
+```bash
+sudo apt update
+sudo apt install elixir
+sudo apt install erlang
+sudo apt install python3-venv -y
+```
 
-## 15.3. Your First Ingestion
+### 3. Elixir Project Setup
+Fetch the Elixir dependencies and compile the project:
 
-Populate the cortex with its first memory using the `/api/v1/ingest` endpoint:
+```bash
+mix deps.get && mix compile 
+```
+
+### 4. Machine Learning Bridge Setup
+Set up a Python virtual environment to run the Machine Learning bridge (which handles embedding generation):
+
+```bash
+python3 -m venv venv
+source venv/bin/activate
+pip3 install fastapi uvicorn 
+pip install sentence-transformers
+```
+
+### 5. Launch the System
+Start the Machine Learning bridge:
+
+```bash
+python ml_bridge.py
+```
+
+Finally, in a separate terminal window, start the ACMS node, providing a name for your agent brain and a port number:
+
+```bash
+./acms.sh my_agent_brain 4000
+```
+
+## 15.2. Connecting Agents via the API
+
+Agents interact with the ACMS exclusively through a RESTful API. Below are examples of how to ingest knowledge and query the memory network.
+
+### Example: Ingestion Task
+
+To store a memory or fact into the system, your agent sends a `POST` request to the `/ingest` endpoint.
+
 ```bash
 curl -X POST http://localhost:4000/api/v1/ingest \
-     -H "Content-Type: application/json" \
-     -H "x-agent-id: admin" \
-     -d '{
-       "fact_text": "ACMS is now active.",
-       "agent_id": "system",
-       "description_payloads": [{"type": "text", "content": "Initialization complete."}]
-     }'
+  -H "Content-Type: application/json" \
+  -H "x-agent-id: root" \
+  -d '{
+    "agent_id": "root",
+    "fact_text": "ACMS uses a bio-mimetic Spreading Activation model instead of standard k-NN vector search.",
+    "acls": {
+      "read": ["public"],
+      "write": ["root", "system"]
+    },
+    "provenance": {
+      "source": "ACMS_Whitepaper",
+      "trust_score": 0.98,
+      "priority": "high"
+    },
+    "description_payloads": [
+      {
+        "type": "text",
+        "content": "This allows the memory grid to retrieve context via synaptic associations rather than just semantic similarity."
+      }
+    ]
+  }'
 ```
 
-## 15.4. Verifying the System
-Open the `LiveMonitor` to watch the system's "State of Mind":
+### Example: Query Task
+
+To retrieve context, your agent sends a `POST` request to the `/query` endpoint.
+
 ```bash
-# In an IEx session
-iex -S mix
-iex> CMS.Tools.LiveMonitor.start()
+curl -X POST http://localhost:4000/api/v1/query \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query_text": "How does the search mechanism work in ACMS?",
+    "agent_id": "root",
+    "reasoning_mode": "normal",
+    "min_relevance": 0.4
+  }'
 ```
 
----
+## 15.3. Testing the Spreading Activation
 
-**Documentation Complete. Authority Established.**
+To see the power of the ACMS in action, you can populate the memory with sample data and test the spreading activation retrieval.
+
+First, ingest sample data using the provided scripts:
+
+```bash
+# Ingest 50 sample nodes containing random facts about the ACMS
+python3 ingest_100_nodes.py
+
+# Ingest 50 sample nodes containing facts about Python
+python3 ingest_100_nodes2.py
+```
+
+Now, test the spreading activation mechanism using the `brainstorm` reasoning mode:
+
+**Test 1:**
+```bash
+curl -X POST http://localhost:4000/api/v1/query \
+  -H "Content-Type: application/json" \
+  -d '{     
+    "query_text": "What stops multiple threads from executing at the exact same time?",
+    "agent_id": "root",
+    "reasoning_mode": "brainstorm",
+    "min_relevance": 0.4,
+    "max_results": 10
+  }'
+```
+
+**Test 2:**
+```bash
+curl -X POST http://localhost:4000/api/v1/query \
+  -H "Content-Type: application/json" \
+  -d '{     
+    "query_text": "How does the system handle a process that crashes or fails?",
+    "agent_id": "root",
+    "reasoning_mode": "brainstorm",
+    "min_relevance": 0.35,
+    "max_results": 10
+  }'
+```

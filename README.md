@@ -50,6 +50,147 @@ The ACMS is built for complexity — for the class of problems where scale, para
 
 ---
 
+**How to Use**
+
+This section provides a clear, step-by-step guide to installing the ACMS and connecting your agents to the memory network via the API. 
+
+### 1. Installation and Setup
+
+First, clone the repository and navigate into the project directory:
+
+```bash
+git clone https://github.com/Gifted87/acms.git
+cd acms
+```
+
+Next, install the necessary dependencies for Elixir, Erlang, and Python. Run the following commands:
+
+```bash
+sudo apt update
+sudo apt install elixir
+sudo apt install erlang
+sudo apt install python3-venv -y
+```
+
+Next, fetch the Elixir dependencies and compile the project:
+
+```bash
+mix deps.get && mix compile 
+```
+
+Set up a Python virtual environment to run the Machine Learning bridge (which handles embedding generation):
+
+```bash
+python3 -m venv venv
+source venv/bin/activate
+pip3 install fastapi uvicorn 
+pip install sentence-transformers
+```
+
+Start the Machine Learning bridge:
+
+```bash
+python ml_bridge.py
+```
+
+Finally, in a separate terminal window, start the ACMS node, providing a name for your agent brain and a port number:
+
+```bash
+./acms.sh my_agent_brain 4000
+```
+
+### 2. Connecting Agents via the API
+
+Agents interact with the ACMS exclusively through a RESTful API. Below are examples of how to ingest knowledge and query the memory network.
+
+#### Example: Ingestion Task
+
+To store a memory or fact into the system, your agent sends a `POST` request to the `/ingest` endpoint.
+
+```bash
+curl -X POST http://localhost:4000/api/v1/ingest \
+  -H "Content-Type: application/json" \
+  -H "x-agent-id: root" \
+  -d '{
+    "agent_id": "root",
+    "fact_text": "ACMS uses a bio-mimetic Spreading Activation model instead of standard k-NN vector search.",
+    "acls": {
+      "read": ["public"],
+      "write": ["root", "system"]
+    },
+    "provenance": {
+      "source": "ACMS_Whitepaper",
+      "trust_score": 0.98,
+      "priority": "high"
+    },
+    "description_payloads": [
+      {
+        "type": "text",
+        "content": "This allows the memory grid to retrieve context via synaptic associations rather than just semantic similarity."
+      }
+    ]
+  }'
+```
+
+#### Example: Query Task
+
+To retrieve context, your agent sends a `POST` request to the `/query` endpoint.
+
+```bash
+curl -X POST http://localhost:4000/api/v1/query \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query_text": "How does the search mechanism work in ACMS?",
+    "agent_id": "root",
+    "reasoning_mode": "normal",
+    "min_relevance": 0.4
+  }'
+```
+
+### 3. Testing the System
+
+To see the power of the ACMS in action, you can populate the memory with sample data and test the spreading activation retrieval.
+
+First, ingest sample data using the provided scripts:
+
+```bash
+# Ingest 50 sample nodes containing random facts about the ACMS
+python3 ingest_100_nodes.py
+
+# Ingest 50 sample nodes containing facts about Python
+python3 ingest_100_nodes2.py
+```
+
+Now, test the spreading activation mechanism using the `brainstorm` reasoning mode:
+
+**Test 1:**
+```bash
+curl -X POST http://localhost:4000/api/v1/query \
+  -H "Content-Type: application/json" \
+  -d '{     
+    "query_text": "What stops multiple threads from executing at the exact same time?",
+    "agent_id": "root",
+    "reasoning_mode": "brainstorm",
+    "min_relevance": 0.4,
+    "max_results": 10
+  }'
+```
+
+**Test 2:**
+```bash
+curl -X POST http://localhost:4000/api/v1/query \
+  -H "Content-Type: application/json" \
+  -d '{     
+    "query_text": "How does the system handle a process that crashes or fails?",
+    "agent_id": "root",
+    "reasoning_mode": "brainstorm",
+    "min_relevance": 0.35,
+    "max_results": 10
+  }'
+```
+
+---
+
 **Documentation**
 
 For a deep-dive into the system architecture, component mechanics, and operational guides, please refer to the documentation.md file.
