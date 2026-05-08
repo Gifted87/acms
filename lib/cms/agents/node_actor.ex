@@ -472,7 +472,8 @@ defmodule CMS.NodeActor do
     end
 
     inhibit = ActivationEngine.get_global_inhibition_factor()
-    threshold = (node.head.relevance_threshold / max(0.1, inhibit)) * cost
+    base_threshold = Map.get(context, :min_relevance, node.head.relevance_threshold)
+    threshold = (base_threshold / max(0.1, inhibit)) * cost
 
     relevance = calculate_relevance(node, context)
     total = relevance + boost
@@ -626,8 +627,8 @@ defmodule CMS.NodeActor do
     # Calculate relevance score between query and node's embedding
     relevance = calculate_relevance(node, context)
 
-    # NodeHead applies its own relevance threshold
-    threshold = node.head.relevance_threshold
+    # Use query-supplied min_relevance when present; fall back to node's own threshold
+    threshold = Map.get(context, :min_relevance, node.head.relevance_threshold)
 
     # Apply metabolic state cost factor
     cost = case node.head.internal_state do
