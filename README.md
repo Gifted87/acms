@@ -52,6 +52,8 @@ The ACMS is built for complexity — for the class of problems where scale, para
 
 **How to Use**
 
+[![Watch the ACMS Demo](https://img.youtube.com/vi/dl1-QOE1oHg/0.jpg)](https://youtu.be/dl1-QOE1oHg)
+
 This section provides a clear, step-by-step guide to installing the ACMS and connecting your agents to the memory network via the API. 
 
 ### 1. Installation and Setup
@@ -194,3 +196,9 @@ curl -X POST http://localhost:4000/api/v1/query \
 **Documentation**
 
 For a deep-dive into the system architecture, component mechanics, and operational guides, please refer to the documentation.md file.
+
+---
+
+**License**
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
