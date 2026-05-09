@@ -36,7 +36,7 @@ Beyond multi-agent systems, the ACMS is also critical for any agent that needs l
 
 **Was It Successful?**
 
-The ACMS became the base memory for the [**Autonomous Cognitive Network (ACN)**](https://github.com/Gifted87/acn) — a multi-agent system designed to build large, complex software from a single prompt, the way a human team would. The ACN orchestrates and organises large numbers of agents running in parallel, each contributing to a shared codebase.
+The ACMS became the base memory for the [**Autonomous Cognitive Network (ACN)**](https://github.com/Gifted87/acn) — a multi-agent system designed to build large, complex production-grade software from a single prompt, the way a human team would. The ACN orchestrates and organises large numbers of agents running in parallel, each contributing to a shared codebase.
 
 In testing, the ACN demonstrated strong cohesion across more than 100 simultaneously running agents, generating over 200 files from scratch without manual coordination. That result would not have been possible without the associative memory layer holding the system together.
 
