@@ -1,8 +1,4 @@
-Here are Chapters 1 through 5 of the Associative Cognitive Memory System (ACMS) documentation. This guide provides an exhaustive, code-deep exploration of the system's paradigms, bootstrapping processes, architecture, data structures, and sensory ingestion pipelines, spanning over 3,000 words.
-
----
-
-# 🧠 Associative Cognitive Memory System (ACMS) Documentation
+# Associative Cognitive Memory System (ACMS) Documentation
 
 ## 1. Introduction: Paradigm Shift
 
